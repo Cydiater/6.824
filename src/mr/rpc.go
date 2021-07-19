@@ -8,6 +8,7 @@ package mr
 
 import "os"
 import "strconv"
+import "time"
 
 //
 // example to show how to declare the arguments
@@ -16,22 +17,16 @@ import "strconv"
 
 // Add your RPC definitions here.
 
-type AllocateMapTaskRequest struct {}
-type AllocateMapTaskReply struct {
-	Filename string
-	NReduce int
+type AllocateTaskRequest struct {
+	Id string
 }
 
-type AllocateReduceTaskRequest struct {}
-type AllocateReduceTaskReply struct {
-	Ifilenames []string
-	Ofilename string
+type AllocateTaskReply struct {
+	Inames []string
+	Onames []string
+	TaskType string
+	FiredTime time.Time
 }
-
-type ReportReduceInputRequest struct {
-	Filenames []string
-}
-type ReportReduceInputReply struct {}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

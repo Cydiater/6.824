@@ -9,7 +9,8 @@ import "encoding/json"
 import "io/ioutil"
 import "bufio"
 import "sort"
-import "strings"
+import "github.com/google/uuid"
+import "time"
 
 //
 // Map functions return a slice of KeyValue.
@@ -18,6 +19,8 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+var id string
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -29,38 +32,21 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func getMapFilename() (string, int) {
-	request := AllocateMapTaskRequest{}
-	reply := AllocateMapTaskReply{}
-	success := call("Master.AllocateMapTask", &request, &reply)
+func getTask(id string) ([]string, []string, string, time.Time) {
+	request := AllocateTaskRequest{
+		Id: id,
+	}
+	reply := AllocateTaskReply{}
+	success := call("Master.AllocateTask", &request, &reply)
 	if success != true {
 		reason := "Failed to exec RPC"
 		log.Fatal(reason)
 	}
-	return reply.Filename, reply.NReduce
-}
-
-func notifyReduceInput(onames []string) {
-	request := ReportReduceInputRequest{
-		Filenames: onames,
+	if reply.TaskType == "wait" {
+		time.Sleep(time.Second)
+		return getTask(id)
 	}
-	reply := ReportReduceInputReply{}
-	success := call("Master.ReportReduceInput", &request, &reply)
-	if success != true {
-		reason := "Failed to exec RPC"
-		log.Fatal(reason)
-	}
-}
-
-func getReduceTask() ([]string, string) {
-	request := AllocateReduceTaskRequest{}
-	reply := AllocateReduceTaskReply{}
-	success := call("Master.AllocateReduceTask", &request, &reply)
-	if success != true {
-		reason := "Failed to exec RPC"
-		log.Fatal(reason)
-	}
-	return reply.Ifilenames, reply.Ofilename
+	return reply.Inames, reply.Onames, reply.TaskType, reply.FiredTime
 }
 
 // for sorting by key.
@@ -71,15 +57,10 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-func DoReduce(reducef func(string, []string) string) bool {
-	Inames, oname := getReduceTask()
-	log.Printf("Got reduce task with count to Inames = %v and oname = %v", len(Inames), oname)
-	if len(oname) == 0 {
-		return false
-	}
+func DoReduce(inames []string, oname string, firedTime time.Time, reducef func(string, []string) string) {
 	kva := make([]KeyValue, 0)
-	for i := 0; i < len(Inames); i++ {
-		iname := Inames[i]
+	for i := 0; i < len(inames); i++ {
+		iname := inames[i]
 		file, err := os.Open(iname)
 		defer file.Close()
 		if err != nil {
@@ -100,19 +81,12 @@ func DoReduce(reducef func(string, []string) string) bool {
 			kva = append(kva, kv)
 		}
 	}
-	for i := 0; i < len(Inames); i++ {
-		err := os.Remove(Inames[i])
-		if err != nil {
-			reason := fmt.Sprintf("Failed to remove %v", Inames[i])
-			log.Fatal(reason)
-		}
-	}
 
 	sort.Sort(ByKey(kva))
 
 	log.Printf("Count to kva = %v", len(kva))
 
-	ofile, err := os.Create(oname)
+	ofile, err := ioutil.TempFile("", oname)
 	defer ofile.Close()
 	if err != nil {
 		reason := fmt.Sprintf("Failed to create %v", oname)
@@ -132,37 +106,59 @@ func DoReduce(reducef func(string, []string) string) bool {
 		reduced := reducef(kva[i].Key, values)
 		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, reduced)
 	}
+	if time.Since(firedTime).Seconds() >= 10.0 {
+		log.Printf("Processing time too long")
+		id = uuid.NewString()
+		return
+	}
 
-	return true
+	err = os.Rename(ofile.Name(), oname)
+	if err != nil {
+		reason := fmt.Sprintf("Failed to rename: %v", err)
+		log.Fatal(reason)
+	}
+
+	for i := 0; i < len(inames); i++ {
+		err := os.Remove(inames[i])
+		if err != nil {
+			reason := fmt.Sprintf("Failed to remove %v", inames[i])
+			log.Fatal(reason)
+		}
+	}
+
+	return
 }
 
-func DoMap(filename string, nReduce int, mapf func(string, string) []KeyValue) {
-	file, err := os.Open(filename)
+func DoMap(iname string, onames []string, firedTime time.Time, mapf func(string, string) []KeyValue) {
+	file, err := os.Open(iname)
 	defer file.Close()
 	if err != nil {
-		reason := fmt.Sprintf("Failed to open %v", filename)
+		reason := fmt.Sprintf("Failed to open %v", iname)
 		log.Fatal(reason)
 	}
 
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
-		reason := fmt.Sprintf("Failed to read content from %v", filename)
+		reason := fmt.Sprintf("Failed to read content from %v", iname)
 		log.Fatal(reason)
 	}
 
-	kva := mapf(filename, string(content))
-	buckets := make([][]KeyValue, nReduce)
+	kva := mapf(iname, string(content))
+	buckets := make([][]KeyValue, len(onames))
 	for i := 0; i < len(kva); i++ {
 		hashValue := ihash(kva[i].Key)
-		bucketIndex := hashValue % nReduce
+		bucketIndex := hashValue % len(onames)
 		buckets[bucketIndex] = append(buckets[bucketIndex], kva[i])
 	}
 
-	onames := make([]string, nReduce)
-	for i := 0; i < nReduce; i++ {
-		components := strings.Split(filename, "/")
-		oname := fmt.Sprintf("mr-%v-%v", components[len(components) - 1], i)
-		onames[i] = oname
+	if time.Since(firedTime).Seconds() >= 10.0 {
+		log.Printf("Processing time too long")
+		id = uuid.NewString()
+		return
+	}
+
+	for i := 0; i < len(onames); i++ {
+		oname := onames[i]
 		ofile, err := os.OpenFile(oname, os.O_APPEND | os.O_CREATE | os.O_WRONLY, 0644)
 		if err != nil {
 			reason := fmt.Sprintf("Failed to open %v", oname)
@@ -181,8 +177,6 @@ func DoMap(filename string, nReduce int, mapf func(string, string) []KeyValue) {
 			}
 		}
 	}
-
-	notifyReduceInput(onames)
 }
 
 //
@@ -191,18 +185,22 @@ func DoMap(filename string, nReduce int, mapf func(string, string) []KeyValue) {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	more := true
-	for more {
-		filename, nReduce := getMapFilename()
-		log.Printf("got map task with filename = %v nReduce = %v", filename, nReduce)
+	id := uuid.NewString()
+	for true {
+		inames, onames, taskType, firedTime := getTask(id)
+		log.Printf("got %v task with len(inames) = %v len(onames) = %v", taskType, len(inames), len(onames))
 
-		if len(filename) == 0 {
-			log.Printf("no more map tasks, continue with reduce")
-			more = DoReduce(reducef)
-			continue
+		if (taskType == "done") {
+			return
 		}
 
-		DoMap(filename, nReduce, mapf)
+		if (taskType == "map") {
+			DoMap(inames[0], onames, firedTime, mapf)
+		}
+
+		if (taskType == "reduce") {
+			DoReduce(inames, onames[0], firedTime, reducef)
+		}
 	}
 }
 

@@ -7,52 +7,117 @@ import "os"
 import "net/rpc"
 import "net/http"
 import "strings"
-import "strconv"
+import "sync"
+import "time"
+import "github.com/google/uuid"
+
+type Task struct {
+	id string
+	inames []string
+	onames []string
+	taskType string
+	status string
+}
+
+type Slave struct {
+	updateTime time.Time
+	id string
+	task *Task
+}
 
 type Master struct {
-	filenames []string
+	inames []string
+	workers map[string]*Slave
+	tasks map[string]*Task
 	nReduce int
-	nMap int
-	ReduceTasks [][]string
+	status string // map -> reduce -> done
+	mu sync.Mutex
 }
 
-// Your code here -- RPC handlers for the worker to call.
-
-func (m *Master) AllocateMapTask(args *AllocateMapTaskRequest, reply *AllocateMapTaskReply) error {
-	reply.Filename = ""
-	reply.NReduce = m.nReduce
-	if len(m.filenames) == 0 {
-		return nil
+func (m *Master) AllocateTask(args *AllocateTaskRequest, reply *AllocateTaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	log.Printf("Recive request from %v", args.Id)
+	var worker *Slave
+	var ok bool
+	if worker, ok = m.workers[args.Id]; !ok { // track to a new worker
+		log.Printf("New worker for %v", args.Id)
+		worker = &Slave {
+			id: args.Id,
+			task: nil,
+		}
+		m.workers[args.Id] = worker
 	}
-	reply.Filename = m.filenames[0]
-	m.filenames = m.filenames[1:]
-	return nil
-}
-
-func (m *Master) AllocateReduceTask(args *AllocateReduceTaskRequest, reply *AllocateReduceTaskReply) error {
-	if len(m.ReduceTasks) == 0 {
-		return nil
+	if worker.task != nil { // checkout last task
+		worker.task.status = "done"
+		delete(m.tasks, worker.task.id)
+		worker.task = nil
+		log.Printf("Remaining %v tasks", len(m.tasks))
 	}
-	if len(m.ReduceTasks[m.nReduce - 1]) != m.nMap {
-		return nil
-	}
-	reply.Ifilenames = m.ReduceTasks[m.nReduce - 1]
-	reply.Ofilename = fmt.Sprintf("mr-out-%v", m.nReduce - 1)
-	m.ReduceTasks = m.ReduceTasks[:(m.nReduce - 1)]
-	m.nReduce -= 1
-	return nil
-}
-
-func (m *Master) ReportReduceInput(args *ReportReduceInputRequest, reply *ReportReduceInputReply) error {
-	onames := args.Filenames
-	for i := 0; i < len(onames); i++ {
-		components := strings.Split(onames[i], "-")
-		index, err := strconv.Atoi(components[len(components) - 1])
-		if err != nil {
-			log.Printf("Failed to parse index from %v", onames[i])
+	worker.updateTime = time.Now()
+	for _, task := range m.tasks { // allocate a new task
+		if task.status == "running" {
 			continue
 		}
-		m.ReduceTasks[index] = append(m.ReduceTasks[index], onames[i])
+		worker.task = task
+		worker.task.status = "running"
+		break
+	}
+	if worker.task != nil { // allocate a task successfully
+		reply.Inames = worker.task.inames
+		reply.Onames = worker.task.onames
+		reply.TaskType = worker.task.taskType
+		reply.FiredTime = worker.updateTime
+		return nil
+	}
+	for id, worker := range m.workers { // handle crashed workers
+		if worker.task == nil {
+			continue
+		}
+		if time.Since(worker.updateTime).Seconds() < 10.0 {
+			continue
+		}
+		log.Printf("worker %v is crashed", worker.id)
+		m.tasks[worker.task.id] = worker.task
+		worker.task.status = "ready"
+		delete(m.workers, id)
+	}
+	if len(m.tasks) == 0 { // switch master status
+		log.Printf("switch master status from %v", m.status)
+		if m.status == "map" {
+			m.status = "reduce"
+		} else if m.status == "reduce" {
+			m.status = "done"
+		}
+	} else {
+		reply.TaskType = "wait"
+		return nil
+	}
+	if m.status == "map" {
+		reply.TaskType = "wait"
+		return nil
+	}
+	if m.status == "reduce" {
+		log.Printf("generate reduce tasks")
+		for i := 0; i < m.nReduce; i++ {
+			task := Task {
+				id: uuid.NewString(),
+				onames: []string{fmt.Sprintf("mr-out-%v", i)},
+				taskType: "reduce",
+				status: "ready",
+			}
+			for j := 0; j < len(m.inames); j++ {
+				components := strings.Split(m.inames[j], "/")
+				task.inames = append(task.inames, fmt.Sprintf("mr-%v-%v", components[len(components) - 1], i))
+			}
+			m.tasks[task.id] = &task
+		}
+		reply.TaskType = "wait"
+		return nil
+	}
+	if m.status == "done" {
+		reply.TaskType = "done"
+		return nil
 	}
 	return nil
 }
@@ -80,7 +145,7 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 	ret := false
 
-	if m.nReduce == 0 {
+	if m.status == "done" {
 		ret = true
 	}
 
@@ -93,12 +158,29 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	m := Master{
+		inames: files,
+		status: "map",
+		tasks: make(map[string]*Task),
+		workers: make(map[string]*Slave),
+	}
 
-	m.filenames = files
 	m.nReduce = nReduce
-	m.nMap = len(files)
-	m.ReduceTasks = make([][]string, nReduce)
+	for _, filename := range files {
+		onames := []string{}
+		for j := 0; j < nReduce; j++ {
+			components := strings.Split(filename, "/")
+			onames = append(onames, fmt.Sprintf("mr-%v-%v", components[len(components) - 1], j))
+		}
+		task := Task {
+			id: uuid.NewString(),
+			inames: []string{filename},
+			onames: onames,
+			taskType: "map",
+			status: "ready",
+		}
+		m.tasks[task.id] = &task
+	}
 
 	m.server()
 	return &m
