@@ -47,6 +47,16 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type BumpMsg struct {
+	Term		int
+	Vote		int
+}
+
+type Token struct {
+	term int
+	role string
+}
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -62,6 +72,7 @@ type Raft struct {
 	currentTerm		int				// the current term of this server
 	votedFor		int				// -1 to indicate null
 	heartbeat		chan int		// channel for heartbeat message 
+	bumpchan		chan BumpMsg
 }
 
 // switch to next term, start as candidate
@@ -78,6 +89,9 @@ func (rf *Raft) nextTerm() {
 // bump to a peer's term, start as follower
 func (rf *Raft) bumpTerm(term int) {
 	rf.mu.Lock()
+	if term < rf.currentTerm {
+		log.Panicf("peer %v bump from %v to %v", rf.me, rf.currentTerm, term)
+	}
 	rf.currentTerm = term
 	rf.role = "follower"
 	rf.votedFor = -1
@@ -86,93 +100,157 @@ func (rf *Raft) bumpTerm(term int) {
 	go rf.waitForElection()
 }
 
-func (rf *Raft) duringElection() {
+func (rf *Raft) bumpTermWithVote(term int, votedFor int) {
+	rf.mu.Lock()
+	if term < rf.currentTerm {
+		log.Panicf("peer %v bump from %v to %v", rf.me, rf.currentTerm, term)
+	}
+	rf.currentTerm = term
+	rf.role = "follower"
+	rf.votedFor = votedFor
+	rf.mu.Unlock()
+
+	go rf.waitForElection()
+}
+
+func (rf *Raft) duringElection() {// {{{
 	if rf.role != "candidate" {
 		log.Panicf("%v during election", rf.role)
 	}
+	if rf.killed() {
+		return
+	}
 
+	// setup token
+	token := Token {
+		term: rf.currentTerm,
+		role: rf.role,
+	}
+
+	// setup sleep
 	sleepAmount := time.Duration(rand.Intn(200) + 300) * time.Millisecond
 	timeout := make(chan bool)
-	isTimeout := false
 	go func() {
-		<-time.After(sleepAmount)
-		timeout <- true
-		isTimeout = true
+		time.Sleep(sleepAmount)
+		close(timeout)
 	}()
 
 	grantedCount := 1
-	finished := make(chan bool)
 	go func() {
-		// request vote from every peer
+		log.Printf("#%v: %v %v working in election expire in %v", token.term, rf.role, rf.me, sleepAmount)
+		replychan := make(chan RequestVoteReply)
+		var wg sync.WaitGroup
 		for index := range rf.peers {
-			if index == rf.me || isTimeout {
+			// no need for self
+			if index == rf.me {
 				continue
 			}
-			args := &RequestVoteArgs{
-				Term: rf.currentTerm,
-				CandidateID: rf.me,
+			// check token
+			if rf.role != token.role || rf.currentTerm != token.term {
+				log.Printf("token %+v invalid for %v", token, rf.me)
+				return
 			}
-			reply := &RequestVoteReply{}
-			ok := rf.sendRequestVote(index, args, reply)
-			if !ok {
-				//log.Printf("sendRequestVote to %v from %v failed", index, rf.me)
-				continue
+			// check killed
+			if rf.killed() {
+				return
 			}
+			wg.Add(1)
+			go func (localIndex int) {
+				// construct requst and response
+				args := &RequestVoteArgs{
+					Term: rf.currentTerm,
+					CandidateID: rf.me,
+				}
+				reply := &RequestVoteReply{}
+				// fire the request
+				log.Printf("#%v: %v RequestVote send to %v", token.term, rf.me, localIndex)
+				ok := rf.sendRequestVote(localIndex, args, reply)
+				log.Printf("#%v: %v RequestVote send to %v finished, ok = %v, reply = %+v", token.term, rf.me, localIndex, ok, reply)
+				if rf.role == token.role && rf.currentTerm == token.term && ok {
+					replychan <- *reply
+				}
+				wg.Done()
+			}(index)
+		}
+		go func() {
+			wg.Wait()
+			close(replychan)
+		}()
+		for reply := range replychan {
 			if reply.Term > rf.currentTerm {
-				finished <- false
+				// peer in new term, abort
 				rf.bumpTerm(reply.Term)
 				return
 			}
+			// vote granted
 			if reply.VoteGranted {
 				grantedCount += 1
 			}
+
+			// check vote count
+			if grantedCount * 2 > len(rf.peers) {
+				// win this election
+				rf.mu.Lock()
+				rf.role = "leader"
+				rf.mu.Unlock()
+
+				go rf.underLeading()
+				return
+			}
 		}
-		finished <- true
 	}()
 
 	select {
 	case <-timeout:
-	case ok := <-finished:
-		if !ok {
-			return
-		}
+	case msg := <-rf.bumpchan:
+		// bump to future term, abort current election
+		rf.bumpTermWithVote(msg.Term, msg.Vote)
+		return
 	}
 
-	log.Printf("peer %v role %v term %v get %v vote", rf.me, rf.role, rf.currentTerm, grantedCount)
-	if grantedCount * 2 > len(rf.peers) {
-		rf.mu.Lock()
-		rf.role = "leader"
-		rf.mu.Unlock()
-
-		go rf.underLeading()
-	} else {
-		if !isTimeout {
-			<-timeout
-		}
+	// timeout, no winner, move to next term
+	if rf.role == token.role && rf.currentTerm == token.term {
 		rf.nextTerm()
 	}
-}
+}// }}}
 
-func (rf *Raft) underLeading() {
-	sleepAmount := time.Duration(100) * time.Millisecond
+func (rf *Raft) underLeading() {// {{{
+	log.Printf("#%v: %v %v under leading", rf.currentTerm, rf.role, rf.me)
 	for {
+		// check killed
+		if rf.killed() {
+			return
+		}
+		// setup sleep 
 		timeout := make(chan bool)
+		sleepAmount := time.Duration(100) * time.Millisecond
 		go func() {
-			<-time.After(sleepAmount)
-			timeout <- true
+			time.Sleep(sleepAmount)
+			close(timeout)
 		}()
+		// send heartbeat to every peer
+		token := Token {
+			term: rf.currentTerm,
+			role: rf.role,
+		}
 		for index := range rf.peers {
 			if index == rf.me {
 				continue
 			}
-			args := &AppendEntriesArgs{
-				Term: rf.currentTerm,
-			}
-			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(index, args, reply)
-			if !ok {
-				//log.Printf("send AppendEntries to %v from %v failed", index, rf.me)
-			}
+			go func(localIndex int) {
+				args := &AppendEntriesArgs{
+					Term: rf.currentTerm,
+				}
+				reply := &AppendEntriesReply{}
+				ok := rf.sendAppendEntries(localIndex, args, reply)
+				if token.role != rf.role || token.term != rf.currentTerm {
+					log.Printf("#%v: %v heartbeat token checking failed", token.term, rf.me)
+				} else if !ok {
+					log.Printf("#%v: %v heartbeat to %v failed", rf.currentTerm, rf.me, localIndex)
+				} else {
+					log.Printf("#%v: %v heartbeat to %v success", rf.currentTerm, rf.me, localIndex)
+				}
+			}(index)
 		}
 		select {
 		case <-timeout:
@@ -181,46 +259,63 @@ func (rf *Raft) underLeading() {
 				rf.bumpTerm(peerTerm)
 				return
 			}
+		case msg := <-rf.bumpchan:
+			rf.bumpTermWithVote(msg.Term, msg.Vote)
+			return
 		}
 	}
-}
+}// }}}
 
-func (rf *Raft) waitForElection() {
+func (rf *Raft) waitForElection() {// {{{
 	if rf.role != "follower" {
 		log.Panicf("%v waiting for election", rf.role)
 	}
 
+	// set up sleep goroutine
 	sleepAmount := time.Duration(rand.Intn(200) + 300) * time.Millisecond
 	timeout := make(chan bool)
 	go func() {
-		<-time.After(sleepAmount)
-		timeout <- true
+		time.Sleep(sleepAmount)
+		close(timeout)
 	}()
 
-	log.Printf("peer %v role %v term %v start waiting %v ms for election", rf.me, rf.role, rf.currentTerm, sleepAmount)
+	//log.Printf("#%v: %v %v waiting for election, expire in %v", rf.currentTerm, rf.role, rf.me, sleepAmount)
 	keepSleep := true
 	for keepSleep {
+		if rf.killed() {
+			return
+		}
 		select {
 		case <-timeout:
+			// check killed
+			if rf.killed() {
+				return
+			}
+			log.Printf("#%v: %v %v waiting for election: timeout", rf.currentTerm, rf.role, rf.me)
 			keepSleep = false
 			rf.nextTerm()
 		case peerTerm := <-rf.heartbeat:
+			//log.Printf("#%v: %v %v waiting for election: heartbeat", rf.currentTerm, rf.role, rf.me)
 			// useless heartbeat
 			if peerTerm < rf.currentTerm {
 				continue
 			}
 			// heartbeat from leader
 			if peerTerm == rf.currentTerm {
-				log.Printf("peer %v role %v term %v continue", rf.me, rf.role, rf.currentTerm)
+				//log.Printf("peer %v role %v term %v continue", rf.me, rf.role, rf.currentTerm)
 				go rf.waitForElection()
 				return
 			}
 			// bump term
 			keepSleep = false
 			rf.bumpTerm(peerTerm)
+		case msg := <-rf.bumpchan:
+			log.Printf("#%v: %v %v waiting for election: bump to new term", rf.currentTerm, rf.role, rf.me)
+			rf.bumpTermWithVote(msg.Term, msg.Vote)
+			return
 		}
 	}
-}
+}// }}}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -280,19 +375,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	// if peer's term is old, rejected
+	// if peer's term is older, rejected
 	if args.Term < rf.currentTerm {
+		return
+	}
+	// if peer's term is newer, accept and bump term
+	rf.mu.Lock()
+	if args.Term > rf.currentTerm {
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		rf.mu.Unlock()
+		rf.bumpchan <- BumpMsg{ Term: args.Term, Vote: args.CandidateID }
 		return
 	}
 	// if already voted and not for this peer, rejected
 	if args.CandidateID != rf.votedFor && rf.votedFor != -1 {
+		rf.mu.Unlock()
 		return
 	}
-
 	// otherwise we can simply granted for 2A
 	reply.VoteGranted = true
-
-	rf.mu.Lock()
 	rf.votedFor = args.CandidateID
 	rf.mu.Unlock()
 }
@@ -408,7 +510,6 @@ func (rf *Raft) killed() bool {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
-	log.Printf("New Round")
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -417,6 +518,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeat = make(chan int)	
+	rf.bumpchan = make(chan BumpMsg)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
