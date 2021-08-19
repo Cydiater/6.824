@@ -57,26 +57,39 @@ type Token struct {
 	role string
 }
 
+type Log struct {
+	Term int
+	Command interface{}
+}
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh		chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	role			string			// leader follower candidate
-	currentTerm		int				// the current term of this server
-	votedFor		int				// -1 to indicate null
-	heartbeat		chan int		// channel for heartbeat message 
-	bumpchan		chan BumpMsg
+	role					string					// leader follower candidate
+	currentTerm		int							// the current term of this server
+	votedFor			int							// -1 to indicate null
+	heartbeat			chan int				// channel for heartbeat message 
+	bumpchan			chan BumpMsg		// pass msg to bump the term
+	log						[]Log
+	commitIndex		int
+	lastApplied		int
+
+	// leader only
+	nextIndex			[]int
+	matchIndex		[]int
 }
 
 // switch to next term, start as candidate
-func (rf *Raft) nextTerm() {
+func (rf *Raft) nextTerm() {// {{{
 	rf.mu.Lock()
 	rf.role = "candidate"
 	rf.currentTerm += 1
@@ -84,10 +97,10 @@ func (rf *Raft) nextTerm() {
 	rf.mu.Unlock()
 
 	go rf.duringElection()
-}
+}// }}}
 
 // bump to a peer's term, start as follower
-func (rf *Raft) bumpTerm(term int) {
+func (rf *Raft) bumpTerm(term int) {// {{{
 	rf.mu.Lock()
 	if term < rf.currentTerm {
 		log.Panicf("peer %v bump from %v to %v", rf.me, rf.currentTerm, term)
@@ -98,9 +111,9 @@ func (rf *Raft) bumpTerm(term int) {
 	rf.mu.Unlock()
 
 	go rf.waitForElection()
-}
+}// }}}
 
-func (rf *Raft) bumpTermWithVote(term int, votedFor int) {
+func (rf *Raft) bumpTermWithVote(term int, votedFor int) {// {{{
 	rf.mu.Lock()
 	if term < rf.currentTerm {
 		log.Panicf("peer %v bump from %v to %v", rf.me, rf.currentTerm, term)
@@ -111,7 +124,7 @@ func (rf *Raft) bumpTermWithVote(term int, votedFor int) {
 	rf.mu.Unlock()
 
 	go rf.waitForElection()
-}
+}// }}}
 
 func (rf *Raft) duringElection() {// {{{
 	if rf.role != "candidate" {
@@ -121,11 +134,13 @@ func (rf *Raft) duringElection() {// {{{
 		return
 	}
 
+	rf.mu.Lock()
 	// setup token
 	token := Token {
 		term: rf.currentTerm,
 		role: rf.role,
 	}
+	rf.mu.Unlock()
 
 	// setup sleep
 	sleepAmount := time.Duration(rand.Intn(200) + 300) * time.Millisecond
@@ -158,7 +173,7 @@ func (rf *Raft) duringElection() {// {{{
 			go func (localIndex int) {
 				// construct requst and response
 				args := &RequestVoteArgs{
-					Term: rf.currentTerm,
+					Term: token.term,
 					CandidateID: rf.me,
 				}
 				reply := &RequestVoteReply{}
@@ -177,7 +192,7 @@ func (rf *Raft) duringElection() {// {{{
 			close(replychan)
 		}()
 		for reply := range replychan {
-			if reply.Term > rf.currentTerm {
+			if reply.Term > token.term {
 				// peer in new term, abort
 				rf.bumpTerm(reply.Term)
 				return
@@ -194,7 +209,7 @@ func (rf *Raft) duringElection() {// {{{
 				rf.role = "leader"
 				rf.mu.Unlock()
 
-				go rf.underLeading()
+				rf.underLeading()
 				return
 			}
 		}
@@ -229,36 +244,41 @@ func (rf *Raft) underLeading() {// {{{
 			close(timeout)
 		}()
 		// send heartbeat to every peer
+		rf.mu.Lock()
 		token := Token {
 			term: rf.currentTerm,
 			role: rf.role,
 		}
+		rf.mu.Unlock()
 		for index := range rf.peers {
 			if index == rf.me {
 				continue
 			}
 			go func(localIndex int) {
 				args := &AppendEntriesArgs{
-					Term: rf.currentTerm,
+					Term: token.term,
 				}
 				reply := &AppendEntriesReply{}
 				ok := rf.sendAppendEntries(localIndex, args, reply)
 				if token.role != rf.role || token.term != rf.currentTerm {
-					log.Printf("#%v: %v heartbeat token checking failed", token.term, rf.me)
+					log.Printf("#%v: leader %v heartbeat to %v token checking failed", token.term, rf.me, localIndex)
 				} else if !ok {
 					log.Printf("#%v: %v heartbeat to %v failed", rf.currentTerm, rf.me, localIndex)
 				} else {
-					log.Printf("#%v: %v heartbeat to %v success", rf.currentTerm, rf.me, localIndex)
+					//log.Printf("#%v: %v heartbeat to %v success", rf.currentTerm, rf.me, localIndex)
 				}
 			}(index)
 		}
 		select {
 		case <-timeout:
 		case peerTerm := <-rf.heartbeat:
+			rf.mu.Lock()
 			if peerTerm > rf.currentTerm {
+				rf.mu.Unlock()
 				rf.bumpTerm(peerTerm)
 				return
 			}
+			rf.mu.Unlock()
 		case msg := <-rf.bumpchan:
 			rf.bumpTermWithVote(msg.Term, msg.Vote)
 			return
@@ -294,23 +314,28 @@ func (rf *Raft) waitForElection() {// {{{
 			log.Printf("#%v: %v %v waiting for election: timeout", rf.currentTerm, rf.role, rf.me)
 			keepSleep = false
 			rf.nextTerm()
+			return
 		case peerTerm := <-rf.heartbeat:
+			rf.mu.Lock()
 			//log.Printf("#%v: %v %v waiting for election: heartbeat", rf.currentTerm, rf.role, rf.me)
 			// useless heartbeat
 			if peerTerm < rf.currentTerm {
+				rf.mu.Unlock()
 				continue
 			}
 			// heartbeat from leader
 			if peerTerm == rf.currentTerm {
 				//log.Printf("peer %v role %v term %v continue", rf.me, rf.role, rf.currentTerm)
-				go rf.waitForElection()
+				rf.mu.Unlock()
+				rf.waitForElection()
 				return
 			}
+			rf.mu.Unlock()
 			// bump term
 			keepSleep = false
 			rf.bumpTerm(peerTerm)
 		case msg := <-rf.bumpchan:
-			log.Printf("#%v: %v %v waiting for election: bump to new term", rf.currentTerm, rf.role, rf.me)
+			log.Printf("#%v: %v %v waiting for election: bump to new term %v", rf.currentTerm, rf.role, rf.me, msg.Term)
 			rf.bumpTermWithVote(msg.Term, msg.Vote)
 			return
 		}
@@ -371,21 +396,22 @@ type RequestVoteReply struct {
 	VoteGranted		bool	// is granted?
 }
 
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {// {{{
+	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
 	// if peer's term is older, rejected
 	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
 		return
 	}
 	// if peer's term is newer, accept and bump term
-	rf.mu.Lock()
 	if args.Term > rf.currentTerm {
 		reply.Term = args.Term
 		reply.VoteGranted = true
-		rf.mu.Unlock()
 		rf.bumpchan <- BumpMsg{ Term: args.Term, Vote: args.CandidateID }
+		rf.mu.Unlock()
 		return
 	}
 	// if already voted and not for this peer, rejected
@@ -397,48 +423,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateID
 	rf.mu.Unlock()
-}
+}// }}}
 
-//{{{
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//}}}
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 type AppendEntriesArgs struct {
-	Term int
+	Term					int
+	LeaderId			int
+	Entries				[]Log
+	PrevLogIndex	int
+	PrevLogTerm		int
+	LeaderCommit	int
 }
 
 type AppendEntriesReply struct {
-
+	Term					int
+	Success				bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -450,7 +453,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-//{{{
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -464,16 +466,73 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-
-	return index, term, isLeader
-}// }}}
+func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, isLeader)
+	// check for leading
+	if rf.role != "leader" {
+		return -1, -1, false;
+	}
+	rf.mu.Lock();
+	// init wg
+	var wg sync.WaitGroup
+	// append to local log
+	rf.log = append(rf.log, Log{Term: rf.currentTerm, Command: command})
+	// get current index
+	thisIndex := len(rf.log) - 1
+	// send AppendEntries to every peer
+	log.Printf("#%v: %v %v send AppendEntries with command %v", rf.currentTerm, rf.role, rf.me, command)
+	for index := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(localIndex int) {
+			defer wg.Done()
+			// construct arguments
+			args := &AppendEntriesArgs{
+				Term: rf.currentTerm,
+				LeaderId: rf.me,
+				Entries: rf.log[rf.nextIndex[localIndex] : ],
+				PrevLogIndex: rf.nextIndex[localIndex] - 1,
+				LeaderCommit: rf.commitIndex,
+			}
+			args.PrevLogTerm = -1
+			if args.PrevLogIndex >= 0 {
+				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			}
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(localIndex, args, reply)
+			log.Printf("ok = %v args = %+v reply = %+v", ok, args, reply)
+			// RPC failed
+			if !ok {
+				return
+			}
+			// Success 
+			if reply.Success {
+				rf.nextIndex[localIndex] = thisIndex + 1
+				rf.matchIndex[localIndex] = thisIndex
+			} 
+		}(index)
+	}
+	wg.Wait()
+	// count the replicated peers
+	cnt := 0
+	for _, match := range rf.matchIndex {
+		if match >= thisIndex {
+			cnt += 1
+		}
+	}
+	log.Printf("#%v: command %v repliatced on %v peers", rf.currentTerm, command, cnt)
+	// commited
+	if cnt * 2 > len(rf.peers) {
+		rf.commitIndex = thisIndex
+		rf.applyCh <- ApplyMsg{CommandValid: true, Command: command, CommandIndex: thisIndex}
+		term := rf.currentTerm
+		rf.mu.Unlock()
+		return thisIndex, term, true
+	}
+	rf.mu.Unlock()
+	return -1, -1, true
+}
 
 //
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -507,8 +566,7 @@ func (rf *Raft) killed() bool {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 
 	rf := &Raft{}
 	rf.peers = peers
@@ -519,6 +577,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeat = make(chan int)	
 	rf.bumpchan = make(chan BumpMsg)
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -527,6 +586,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = "follower"
 	rf.currentTerm = 0
 	rf.votedFor = -1
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = 0
+		rf.matchIndex[i] = -1
+	}
 
 	go rf.waitForElection()
 
