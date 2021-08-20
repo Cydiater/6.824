@@ -23,6 +23,7 @@ import (
 	"log"
 	"math/rand"
 	"time"
+	"sort"
 
 	"../labrpc"
 )
@@ -49,7 +50,6 @@ type ApplyMsg struct {
 
 type BumpMsg struct {
 	Term		int
-	Vote		int
 }
 
 type Token struct {
@@ -64,7 +64,6 @@ type Log struct {
 
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	applyMu		sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -83,7 +82,7 @@ type Raft struct {
 	log						[]Log
 	commitIndex		int
 	lastApplied		int
-	newCommit			*sync.Cond
+	commitCond		*sync.Cond
 
 	// leader only
 	nextIndex			[]int
@@ -112,20 +111,7 @@ func (rf *Raft) bumpTerm(term int) {// {{{
 	rf.votedFor = -1
 	rf.mu.Unlock()
 
-	go rf.waitForElection()
-}// }}}
-
-func (rf *Raft) bumpTermWithVote(term int, votedFor int) {// {{{
-	rf.mu.Lock()
-	if term < rf.currentTerm {
-		log.Panicf("peer %v bump from %v to %v", rf.me, rf.currentTerm, term)
-	}
-	rf.currentTerm = term
-	rf.role = "follower"
-	rf.votedFor = votedFor
-	rf.mu.Unlock()
-
-	go rf.waitForElection()
+	rf.waitForElection()
 }// }}}
 
 func (rf *Raft) duringElection() {// {{{
@@ -205,7 +191,8 @@ func (rf *Raft) duringElection() {// {{{
 						wg.Done()
 						return
 					}
-					// retry
+					// sleep and retry
+					time.Sleep(time.Millisecond * 10)
 				}
 			}(index)
 		}
@@ -241,7 +228,7 @@ func (rf *Raft) duringElection() {// {{{
 	case <-timeout:
 	case msg := <-rf.bumpchan:
 		// bump to future term, abort current election
-		rf.bumpTermWithVote(msg.Term, msg.Vote)
+		rf.bumpTerm(msg.Term)
 		return
 	}
 
@@ -278,16 +265,32 @@ func (rf *Raft) underLeading() {// {{{
 			}
 			wg.Add(1)
 			go func(localIndex int) {
-				args := rf.genAppendEntriesArgs(rf.nextIndex[localIndex] - 1)
+				preLogIndex := rf.nextIndex[localIndex] - 1
+				args, nextIndex := rf.genAppendEntriesArgs(preLogIndex)
+				rf.nextIndex[localIndex] = nextIndex + 1
 				wg.Done()
 				reply := &AppendEntriesReply{}
+				log.Printf("#%v: %v heartbeat to %v ready to send, args = %+v", rf.currentTerm, rf.me, localIndex, args)
 				ok := rf.sendAppendEntries(localIndex, args, reply)
+				// check token
 				if token.role != rf.role || token.term != rf.currentTerm {
-					log.Printf("#%v: leader %v heartbeat to %v token checking failed", token.term, rf.me, localIndex)
-				} else if !ok {
+					return
+				} 
+				if !ok {
 					log.Printf("#%v: %v heartbeat to %v failed", rf.currentTerm, rf.me, localIndex)
+				} else if (reply.Success) {
+					log.Printf("#%v: %v heartbeat to %v success, reply = %+v", rf.currentTerm, rf.me, localIndex, reply)
+					rf.mu.Lock()
+					rf.matchIndex[localIndex] = nextIndex
+					rf.nextIndex[localIndex] = nextIndex + 1
+					rf.commitCond.Broadcast()
+					rf.mu.Unlock()
+					log.Printf("#%v: %v %v updated matchIndex = %v ", rf.currentTerm, rf.role, rf.me, rf.matchIndex)
 				} else {
-					log.Printf("#%v: %v heartbeat to %v success", rf.currentTerm, rf.me, localIndex)
+					log.Printf("#%v: %v heartbeat to %v failed, reply = %+v", rf.currentTerm, rf.me, localIndex, reply)
+					rf.mu.Lock()
+					rf.nextIndex[localIndex] = preLogIndex
+					rf.mu.Unlock()
 				}
 			}(index)
 		}
@@ -299,12 +302,14 @@ func (rf *Raft) underLeading() {// {{{
 			rf.mu.Lock()
 			if peerTerm > rf.currentTerm {
 				rf.mu.Unlock()
+				log.Printf("#%v: %v %v bump to new term %v", rf.currentTerm, rf.role, rf.me, peerTerm)
 				rf.bumpTerm(peerTerm)
 				return
 			}
 			rf.mu.Unlock()
 		case msg := <-rf.bumpchan:
-			rf.bumpTermWithVote(msg.Term, msg.Vote)
+			log.Printf("#%v: %v %v bump to new term %v", rf.currentTerm, rf.role, rf.me, msg.Term)
+			rf.bumpTerm(msg.Term)
 			return
 		}
 	}
@@ -323,7 +328,7 @@ func (rf *Raft) waitForElection() {// {{{
 		close(timeout)
 	}()
 
-	//log.Printf("#%v: %v %v waiting for election, expire in %v", rf.currentTerm, rf.role, rf.me, sleepAmount)
+	log.Printf("#%v: %v %v waiting for election, expire in %v", rf.currentTerm, rf.role, rf.me, sleepAmount)
 	keepSleep := true
 	for keepSleep {
 		if rf.killed() {
@@ -360,7 +365,7 @@ func (rf *Raft) waitForElection() {// {{{
 			rf.bumpTerm(peerTerm)
 		case msg := <-rf.bumpchan:
 			log.Printf("#%v: %v %v waiting for election: bump to new term %v", rf.currentTerm, rf.role, rf.me, msg.Term)
-			rf.bumpTermWithVote(msg.Term, msg.Vote)
+			rf.bumpTerm(msg.Term)
 			return
 		}
 	}
@@ -435,7 +440,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {// 
 	// if peer's term is newer, bump to new term and let leader retry
 	if args.Term > rf.currentTerm {
 		rf.mu.Unlock()
-		rf.bumpchan <- BumpMsg{ Term: args.Term, Vote: args.CandidateID }
+		rf.bumpchan <- BumpMsg{ Term: args.Term }
 		return
 	}
 	// if already voted and not for this peer, rejected
@@ -449,6 +454,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {// 
 		myLogTerm = rf.log[myLogIndex].Term
 	}
 	// if my log is newer than candiate's log, rejected 
+	log.Printf("#%v: %v %v log = %+v", rf.currentTerm, rf.role, rf.me, rf.log)
 	if myLogTerm > args.LastLogTerm || (myLogTerm == args.LastLogTerm && myLogIndex > args.LastLogTerm) {
 		rf.mu.Unlock()
 		return
@@ -463,18 +469,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs {
+func (rf *Raft) genAppendEntriesArgs(prevLogIndex int) (*AppendEntriesArgs, int) {
 	args := &AppendEntriesArgs {
 		Term: rf.currentTerm,
 		LeaderId: rf.me,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm: -1,
+		Entries: rf.log[prevLogIndex + 1 : ],
 		LeaderCommit: rf.commitIndex,
 	}
 	if args.PrevLogIndex >= 0 {
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 	}
-	return args
+	nextIndex := len(rf.log) - 1
+	return args, nextIndex
 }
 
 type AppendEntriesArgs struct {
@@ -517,12 +525,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.log = rf.log[:args.PrevLogIndex + 1]
 	rf.log = append(rf.log, args.Entries...)
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommit
-		if len(rf.log) - 1 < rf.commitIndex {
-			rf.commitIndex = len(rf.log) - 1
+	candidateCommitIndex := args.LeaderCommit
+	if len(rf.log) - 1 < candidateCommitIndex {
+		candidateCommitIndex = len(rf.log) - 1
+	}
+	if  candidateCommitIndex > rf.commitIndex {
+		for i := rf.commitIndex + 1; i <= candidateCommitIndex; i++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command: rf.log[i].Command,
+				CommandIndex: i + 1,
+			}
+			log.Printf("%v %v applied commit %v", rf.role, rf.me, i)
 		}
-		rf.newCommit.Broadcast()
+		rf.commitIndex = candidateCommitIndex
 	}
 	reply.Success = true;
 }// }}}
@@ -553,80 +569,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, i
 	// append to local log
 	rf.mu.Lock();
 	rf.log = append(rf.log, Log{Term: rf.currentTerm, Command: command})
-	thisIndex := len(rf.log) - 1
-	log.Printf("#%v: %v %v start command %v", rf.currentTerm, rf.role, rf.me, thisIndex)
-	pre_args := make([]AppendEntriesArgs, len(rf.peers))
-	// construct args for every peer
-	for index := range rf.peers {
-		if index == rf.me {
-			continue
-		}
-		pre_args[index] = *rf.genAppendEntriesArgs(rf.nextIndex[index] - 1)
-		pre_args[index].Entries = rf.log[rf.nextIndex[index] : ]
-	}
-	token := Token {
-		term: rf.currentTerm,
-		role: rf.role,
-	}
+	index := len(rf.log) - 1
+	term := rf.currentTerm
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+	log.Printf("#%v: %v %v updated matchIndex = %v with new command %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index)
+	rf.commitCond.Broadcast()
 	rf.mu.Unlock()
-	// send AppendEntries to every peer
-	successChan := make(chan bool, len(rf.peers) - 1)
-	for index := range rf.peers {
-		if index == rf.me {
-			continue
-		}
-		go func(localIndex int) {
-			// construct arguments
-			reply := &AppendEntriesReply{}
-			for {
-				// check token
-				if rf.role != token.role || rf.currentTerm != token.term {
-					return
-				}
-				ok := rf.sendAppendEntries(localIndex, &pre_args[localIndex], reply)
-				// RPC failed
-				if !ok {
-					log.Printf("#%v: %v %v sendAppendEntries to %v failed", rf.currentTerm, rf.role, rf.me, localIndex)
-					continue
-				}
-				// check token
-				if rf.role != token.role || rf.currentTerm != token.term {
-					return
-				}
-				// Success 
-				if reply.Success {
-					rf.mu.Lock()
-					rf.nextIndex[localIndex] = thisIndex + 1
-					rf.matchIndex[localIndex] = thisIndex
-					rf.mu.Unlock()
-					successChan <- true
-					log.Printf("#%v: %v %v adjust nextIndex[%v] to %v", rf.currentTerm, rf.role, rf.me, localIndex, rf.nextIndex[localIndex])
-					return
-				} else {
-					// decrease nextIndex
-					rf.nextIndex[localIndex] -= 1
-					log.Printf("#%v: %v %v adjust nextIndex[%v] to %v", rf.currentTerm, rf.role, rf.me, localIndex, rf.nextIndex[localIndex])
-				}
-			}
-		}(index)
-	}
-	// count the replicated peers
-	cnt := 1
-	for {
-		select {
-		case <- successChan:
-			cnt += 1
-			log.Printf("#%v: command %v repliatced on %v peers", rf.currentTerm, thisIndex, cnt)
-			if cnt * 2 > len(rf.peers) {
-				rf.mu.Lock()
-				rf.commitIndex = thisIndex
-				rf.newCommit.Broadcast()
-				term := rf.currentTerm
-				rf.mu.Unlock()
-				return thisIndex + 1, term, true
-			}
-		}
-	}
+	return index + 1, term, true
 }
 
 //
@@ -650,22 +599,36 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// just for leader, check for new commit index
 func (rf *Raft) moniterCommit() {
-	appliedIndex := -1
-	rf.applyMu.Lock()
+	rf.commitCond.L.Lock()
 	for !rf.killed() {
-		for appliedIndex < rf.commitIndex {
-			appliedIndex += 1
-			rf.applyCh <- ApplyMsg {
-				CommandValid: true,
-				Command: rf.log[appliedIndex].Command,
-				CommandIndex: appliedIndex + 1,
-			}
-			log.Printf("#%v: %v %v apply %v", rf.currentTerm, rf.role, rf.me, appliedIndex)
+		// check for leader
+		if rf.role != "leader" {
+			rf.commitCond.Wait()
+			continue
 		}
-		rf.newCommit.Wait()
+		rf.mu.Lock()
+		buf := make([]int, len(rf.peers))
+		copy(buf[:], rf.matchIndex)
+		sort.Ints(buf)
+		majorityIndex := (len(rf.peers) + 1) / 2 - 1
+		candidateIndex := buf[majorityIndex]
+		if candidateIndex > rf.commitIndex {
+			for i := rf.commitIndex + 1; i <= candidateIndex; i++ {
+				rf.applyCh <- ApplyMsg {
+					CommandValid: true,
+					Command: rf.log[i].Command,
+					CommandIndex: i + 1,
+				}
+				log.Printf("%v %v applied commit %v", rf.role, rf.me, i)
+			}
+			rf.commitIndex = candidateIndex
+		}
+		rf.mu.Unlock()
+		rf.commitCond.Wait()
 	}
-	rf.applyMu.Unlock()
+	rf.commitCond.L.Unlock()
 }
 
 //
@@ -700,7 +663,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = -1
-	rf.newCommit = sync.NewCond(&rf.applyMu)
+	rf.commitCond = sync.NewCond(new(sync.Mutex))
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))

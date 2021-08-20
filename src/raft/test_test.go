@@ -14,7 +14,6 @@ import "time"
 import "math/rand"
 import "sync/atomic"
 import "sync"
-import "log"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -96,7 +95,6 @@ func TestBasicAgree2B(t *testing.T) {
 
 	iters := 3
 	for index := 1; index < iters+1; index++ {
-		log.Printf("iter = %v", index)
 		nd, _ := cfg.nCommitted(index)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
