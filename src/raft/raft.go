@@ -176,7 +176,7 @@ func (rf *Raft) duringElection() {// {{{
 				}
 				reply := &RequestVoteReply{}
 				rf.mu.Unlock()
-				for {
+				for !rf.killed() {
 					// check token
 					if rf.role != token.role || rf.currentTerm != token.term {
 						return
@@ -263,11 +263,7 @@ func (rf *Raft) underLeading() {// {{{
 	}
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 	rf.mu.Unlock()
-	for {
-		// check killed
-		if rf.killed() {
-			return
-		}
+	for !rf.killed() {
 		// setup sleep 
 		timeout := make(chan bool)
 		sleepAmount := time.Duration(100) * time.Millisecond
