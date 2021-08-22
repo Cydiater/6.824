@@ -255,6 +255,14 @@ func (rf *Raft) duringElection() {// {{{
 
 func (rf *Raft) underLeading() {// {{{
 	log.Printf("#%v: %v %v under leading", rf.currentTerm, rf.role, rf.me)
+	rf.mu.Lock()
+	// init nextIndex and matchIndex
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = -1
+	}
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+	rf.mu.Unlock()
 	for {
 		// check killed
 		if rf.killed() {
@@ -267,13 +275,14 @@ func (rf *Raft) underLeading() {// {{{
 			time.Sleep(sleepAmount)
 			close(timeout)
 		}()
-		// send heartbeat to every peer
+
 		rf.mu.Lock()
 		token := Token {
 			term: rf.currentTerm,
 			role: rf.role,
 		}
 		var wg sync.WaitGroup
+		// send heartbeat to every peer
 		for index := range rf.peers {
 			if index == rf.me {
 				continue
@@ -282,31 +291,30 @@ func (rf *Raft) underLeading() {// {{{
 			go func(localIndex int) {
 				preLogIndex := rf.nextIndex[localIndex] - 1
 				args, nextIndex := rf.genAppendEntriesArgs(preLogIndex)
+				log.Printf("#%v: %v heartbeat to %v ready to send, args = %+v, nextIndex = %v", rf.currentTerm, rf.me, localIndex, args, rf.nextIndex)
 				rf.nextIndex[localIndex] = nextIndex + 1
 				wg.Done()
 				reply := &AppendEntriesReply{}
-				log.Printf("#%v: %v heartbeat to %v ready to send, args = %+v", rf.currentTerm, rf.me, localIndex, args)
 				ok := rf.sendAppendEntries(localIndex, args, reply)
 				// check token
+				rf.mu.Lock()
 				if token.role != rf.role || token.term != rf.currentTerm {
+					rf.mu.Unlock()
 					return
 				} 
 				if !ok {
 					log.Printf("#%v: %v heartbeat to %v failed", rf.currentTerm, rf.me, localIndex)
 				} else if (reply.Success) {
 					log.Printf("#%v: %v heartbeat to %v success, reply = %+v", rf.currentTerm, rf.me, localIndex, reply)
-					rf.mu.Lock()
 					rf.matchIndex[localIndex] = nextIndex
-					rf.nextIndex[localIndex] = nextIndex + 1
 					rf.commitCond.Broadcast()
-					rf.mu.Unlock()
-					log.Printf("#%v: %v %v updated matchIndex = %v ", rf.currentTerm, rf.role, rf.me, rf.matchIndex)
+					log.Printf("#%v: %v %v updated matchIndex = %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex)
 				} else {
 					log.Printf("#%v: %v heartbeat to %v failed, reply = %+v", rf.currentTerm, rf.me, localIndex, reply)
-					rf.mu.Lock()
 					rf.nextIndex[localIndex] = preLogIndex
-					rf.mu.Unlock()
+					log.Printf("#%v: %v %v updated nextIndex = %v", rf.currentTerm, rf.role, rf.me, rf.nextIndex)
 				}
+				rf.mu.Unlock()
 			}(index)
 		}
 		wg.Wait()
@@ -524,6 +532,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
+	// request from leader, convert to follower
+	if args.Term == rf.currentTerm {
+		rf.role = "follower"
+	}
 	// don't have this index
 	if args.PrevLogIndex >= len(rf.log) {
 		return
@@ -680,15 +692,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.commitIndex = -1
 	rf.commitCond = sync.NewCond(new(sync.Mutex))
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = 0
+		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = -1
 	}
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	go rf.waitForElection()
 	go rf.moniterCommit()
