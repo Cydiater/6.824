@@ -1,15 +1,3 @@
-// TODO 
-// Reconstruct the structure
-// one main background 
-//	for leader:			main task: send AppendEntries RPC to every peer
-//									- ready for bump term	-> become a candidate
-//  for follower:		main task: election count down
-//									- ready for bump term to newer term -> become follower in new term
-//									- ready for heart beat from same term -> continue as follower
-//	for candidate:	main task: send RequestVote RPC to every peer
-//									- ready for bump term to newer term -> become follower in new term
-//									- ready for heart beat from same term -> become a follower
-
 package raft
 
 import (
@@ -141,6 +129,10 @@ type Raft struct {
 
 // switch to next term, start as candidate
 func (rf *Raft) nextTerm() {// {{{
+	if rf.killed() {
+		return
+	}
+
 	rf.mu.Lock()
 	rf.role = "candidate"
 	rf.currentTerm += 1
@@ -287,7 +279,6 @@ func (rf *Raft) underLeading() {// {{{
 			}
 			go func(localIndex int) {
 				reply := &AppendEntriesReply{}
-				log.Printf("#%v: %v $%v AppendEntriesArgs = %+v", rf.currentTerm, rf.role, rf.me, pargs[localIndex])
 				ok := rf.sendAppendEntries(localIndex, &pargs[localIndex], reply)
 				// check token
 				if token.role != rf.role || token.term != rf.currentTerm {
@@ -299,7 +290,6 @@ func (rf *Raft) underLeading() {// {{{
 				}
 				// got reply
 				rf.mu.Lock()
-				log.Printf("#%v: %v $%v AppendEntriesReply = %+v", rf.currentTerm, rf.role, rf.me, reply)
 				if (reply.Success) {
 					rf.matchIndex[localIndex] = pargs[localIndex].PrevLogIndex + len(pargs[localIndex].Entries)
 					log.Printf("#%v: %v $%v updated matchIndex = %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex)
@@ -396,7 +386,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {// 
 		return
 	}
 	myLogIndex, myLogTerm := rf.latestLogIndexAndTerm()
-	// if my log is newer than candiate's log, rejected 
+	// if my log is newer than candidate's log, rejected 
 	if myLogTerm > args.LastLogTerm || (myLogTerm == args.LastLogTerm && myLogIndex > args.LastLogIndex) {
 		rf.mu.Unlock()
 		return
@@ -437,9 +427,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// leader in same term 
 	if args.Term == rf.currentTerm {
-		if rf.role == "candiate" {
+		if rf.role == "candidate" {
 			rf.role = "follower"
 			log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+			go rf.waitForElection()
 		} else if rf.role == "follower" {
 			rf.heartbeat <- true
 		}
@@ -474,7 +465,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Command: rf.log[i].Command,
 				CommandIndex: i + 1,
 			}
-			log.Printf("%v %v applied commit %v", rf.role, rf.me, i)
+			log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 		}
 		rf.commitIndex = candidateCommitIndex
 	}
@@ -512,7 +503,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, i
 	term := rf.currentTerm
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 	rf.nextIndex[rf.me] = len(rf.log)
-	log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index)
+	log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index, command)
 	rf.commitCond.Broadcast()
 	rf.mu.Unlock()
 	return index + 1, term, true
@@ -561,9 +552,9 @@ func (rf *Raft) moniterCommit() {
 					Command: rf.log[i].Command,
 					CommandIndex: i + 1,
 				}
-				log.Printf("%v %v applied commit %v", rf.role, rf.me, i)
+				log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
+				rf.commitIndex = i
 			}
-			rf.commitIndex = candidateIndex
 		}
 		rf.mu.Unlock()
 		rf.commitCond.Wait()
