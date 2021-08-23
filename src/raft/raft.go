@@ -241,6 +241,7 @@ func (rf *Raft) underLeading() {// {{{
 		rf.matchIndex[i] = -1
 	}
 	rf.matchIndex[rf.me] = len(rf.log) - 1
+	rf.nextIndex[rf.me] = len(rf.log)
 	// capture current state
 	token := Token {
 		term: rf.currentTerm,
@@ -510,6 +511,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, i
 	index := len(rf.log) - 1
 	term := rf.currentTerm
 	rf.matchIndex[rf.me] = len(rf.log) - 1
+	rf.nextIndex[rf.me] = len(rf.log)
 	log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index)
 	rf.commitCond.Broadcast()
 	rf.mu.Unlock()
