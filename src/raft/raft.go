@@ -109,7 +109,6 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	applyCh		chan ApplyMsg
 
-	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -296,7 +295,19 @@ func (rf *Raft) underLeading() {// {{{
 					rf.commitCond.Broadcast()
 				} else {
 					rf.nextIndex[localIndex] = max(pargs[localIndex].PrevLogIndex, 0)
-					if reply.ConflictIndex != -1 {
+					if reply.ConflictTerm != -1 {
+						st := -1
+						for i := range rf.log {
+							if rf.log[i].Term == reply.ConflictTerm {
+								st = i
+							}
+						}
+						if st == -1 {
+							rf.nextIndex[localIndex] = reply.ConflictIndex
+						} else {
+							rf.nextIndex[localIndex] = st + 1
+						}
+					} else if reply.ConflictIndex != -1 {
 						rf.nextIndex[localIndex] = reply.ConflictIndex
 					}
 					log.Printf("#%v: %v $%v updated nextIndex = %v", rf.currentTerm, rf.role, rf.me, rf.nextIndex)
@@ -418,6 +429,7 @@ type AppendEntriesReply struct {
 	Term					int
 	Success				bool
 	ConflictIndex	int
+	ConflictTerm	int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {// {{{
@@ -426,6 +438,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.ConflictIndex = -1
+	reply.ConflictTerm = -1
 	// old request, useless
 	if args.Term < rf.currentTerm {
 		return
@@ -456,6 +469,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// prev log index not match prev term
 	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = args.PrevLogIndex
+		for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex - 1].Term == rf.log[reply.ConflictIndex].Term {
+			reply.ConflictIndex -= 1
+		}
 		rf.log = rf.log[:args.PrevLogIndex]
 		rf.persist()
 		return
@@ -587,11 +605,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 
-	// Your initialization code here (2A, 2B, 2C).
 	rf.heartbeat = make(chan bool)	
 	rf.applyCh = applyCh
 
-	// all node start with follower, term = 0
 	rf.role = "follower"
 	rf.currentTerm = 0
 	rf.votedFor = -1
