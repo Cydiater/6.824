@@ -296,6 +296,9 @@ func (rf *Raft) underLeading() {// {{{
 					rf.commitCond.Broadcast()
 				} else {
 					rf.nextIndex[localIndex] = max(pargs[localIndex].PrevLogIndex, 0)
+					if reply.ConflictIndex != -1 {
+						rf.nextIndex[localIndex] = reply.ConflictIndex
+					}
 					log.Printf("#%v: %v $%v updated nextIndex = %v", rf.currentTerm, rf.role, rf.me, rf.nextIndex)
 				}
 				rf.mu.Unlock()
@@ -414,6 +417,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term					int
 	Success				bool
+	ConflictIndex	int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {// {{{
@@ -421,6 +425,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.ConflictIndex = -1
 	// old request, useless
 	if args.Term < rf.currentTerm {
 		return
@@ -446,6 +451,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// don't have this index
 	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 	// prev log index not match prev term
@@ -545,7 +551,7 @@ func (rf *Raft) moniterCommit() {
 		sort.Ints(buf)
 		majorityIndex := (len(rf.peers) + 1) / 2 - 1
 		candidateIndex := buf[majorityIndex]
-		if candidateIndex > rf.commitIndex {
+		if candidateIndex > rf.commitIndex && rf.log[candidateIndex].Term == rf.currentTerm {
 			for i := rf.commitIndex + 1; i <= candidateIndex; i++ {
 				rf.applyCh <- ApplyMsg {
 					CommandValid: true,
