@@ -3,6 +3,8 @@ package kvraft
 import "../labrpc"
 import "crypto/rand"
 import "math/big"
+import "time"
+import "log"
 
 
 type Clerk struct {
@@ -37,9 +39,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+	i := 0
+	for {
+		args := GetArgs { key }
+		reply := GetReply {  }
+		if i == len(ck.servers) {
+			i = 0
+		}
+		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			i += 1
+			log.Printf("%v: Get with key %v failed: network", i, key)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if reply.Err == "not leader" {
+			i += 1
+			log.Printf("%v: Get with key %v failed: not leader", i, key)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if reply.Err == "unknown err" {
+			log.Printf("%v: Get with key %v failed: unknown", i, key)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		log.Printf("%v: Get with key %v sucess value = %v", i, key, reply.Value)
+		return reply.Value
+	}
 }
 
 //
@@ -53,7 +80,34 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	i := 0
+	for {
+		if i == len(ck.servers) {
+			i = 0
+		}
+		args := PutAppendArgs { key, value, op }
+		reply := PutAppendReply {  }
+		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			i += 1
+			log.Printf("%v: PutAppend with (%v, %v, %v) failed: network", i, op, key, value)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if reply.Err == "not leader" {
+			i += 1
+			log.Printf("%v: PutAppend with (%v, %v, %v) failed: not leader", i, op, key, value)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if reply.Err == "unknown err" {
+			log.Printf("%v: PutAppend with (%v, %v, %v) failed: unknown", i, op, key, value)
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		log.Printf("%v: PutAppend with (%v, %v, %v) success", i, op, key, value)
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

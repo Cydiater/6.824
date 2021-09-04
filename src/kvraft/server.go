@@ -6,8 +6,14 @@ import (
 	"log"
 	"../raft"
 	"sync"
+	"bytes"
 	"sync/atomic"
+	"github.com/google/uuid"
 )
+
+func init() {
+	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
+}
 
 const Debug = 0
 
@@ -18,32 +24,74 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Action				string
+	Key						string
+	Value					string
+	UUID					string
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu						sync.Mutex
+	me						int
+	rf						*raft.Raft
+	applyCh				chan raft.ApplyMsg
+	dead					int32 // set by Kill()
 
-	maxraftstate int // snapshot if log grows this big
-
-	// Your definitions here.
+	maxraftstate	int // snapshot if log grows this big
+	kv						map[string]string
+	ansChan				map[string]chan struct {string; bool}
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	_, is_leader := kv.rf.GetState()
+	if !is_leader {
+		reply.Err = "not leader"
+		kv.mu.Unlock()
+		return
+	}
+	op := Op {
+		Action: "Get",
+		Key: args.Key,
+		Value: "",
+		UUID: uuid.NewString(),
+	}
+	kv.ansChan[op.UUID] = make(chan struct {string; bool})
+	c := kv.ansChan[op.UUID]
+	kv.mu.Unlock()
+	kv.rf.Start(op.marshall())
+	res := <-c
+	reply.Err = "unknown err"
+	if res.bool {
+		reply.Err = "ok"
+		reply.Value = res.string;
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.mu.Lock()
+	_, is_leader := kv.rf.GetState()
+	if !is_leader {
+		reply.Err = "not leader"
+		kv.mu.Unlock()
+		return
+	}
+	op := Op {
+		Action: args.Op,
+		Key: args.Key,
+		Value: args.Value,
+		UUID: uuid.NewString(),
+	}
+	kv.ansChan[op.UUID] = make(chan struct {string; bool})
+	c := kv.ansChan[op.UUID]
+	kv.mu.Unlock()
+	kv.rf.Start(op.marshall())
+	res := <-c
+	reply.Err = "unknown err"
+	if res.bool {
+		reply.Err = "ok"
+	}
 }
 
 //
@@ -67,6 +115,63 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (op *Op) marshall() []byte {
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(op.Action)
+	e.Encode(op.Key)
+	e.Encode(op.Value)
+	e.Encode(op.UUID);
+	return buf.Bytes()
+}
+
+func (op *Op) unmarshall(b []byte) {
+	buf := bytes.NewBuffer(b)
+	d := labgob.NewDecoder(buf)
+	d.Decode(&op.Action)
+	d.Decode(&op.Key)
+	d.Decode(&op.Value)
+	d.Decode(&op.UUID)
+}
+
+func (kv *KVServer) maintainKV() {
+	for apply := range kv.applyCh {
+		op := Op{}
+		b, ok := apply.Command.([]byte)
+		if !ok {
+			log.Panicf("Failed to unmarshall to op")
+		}
+		op.unmarshall(b)
+		kv.mu.Lock()
+		c, haveChan := kv.ansChan[op.UUID]
+		if op.Action == "Get" {
+			v, ok := kv.kv[op.Key]
+			if !ok {
+				v = ""
+			}
+			if haveChan {
+				c <- struct {string; bool} {v, true}
+			}
+		} else if op.Action == "Put" {
+			kv.kv[op.Key] = op.Value
+			if haveChan {
+				c <- struct {string; bool} {"", true}
+			}
+		} else if op.Action == "Append" {
+			v, ok := kv.kv[op.Key]
+			if !ok {
+				v = ""
+			} 
+			v += op.Value
+			kv.kv[op.Key] = v
+			if haveChan {
+				c <- struct {string; bool} {"", true}
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -82,20 +187,18 @@ func (kv *KVServer) killed() bool {
 // for any long-running work.
 //
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
+	kv.kv = make(map[string]string)
+	kv.ansChan = make(map[string]chan struct {string; bool})
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	go kv.maintainKV();
 
 	return kv
 }
