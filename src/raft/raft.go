@@ -3,7 +3,6 @@ package raft
 import (
 	"sync"
 	"sync/atomic"
-	"log"
 	"math/rand"
 	"time"
 	"sort"
@@ -57,7 +56,11 @@ func (rf *Raft) persist() {
 }
 
 func (rf *Raft) GetState() (int, bool) {
-	return rf.currentTerm, rf.role == "leader"
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	role := rf.role
+	rf.mu.Unlock()
+	return currentTerm, role == "leader"
 }
 
 func (rf *Raft) readPersist(data []byte) {
@@ -72,7 +75,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil ||
 	   d.Decode(&votedFor) != nil ||
 		 d.Decode(&logs) != nil {
-			 log.Fatalf("decode failed")
+			 //log.Fatalf("decode failed")
 	 } else {
 	   rf.currentTerm = currentTerm
 	   rf.votedFor = votedFor
@@ -137,7 +140,7 @@ func (rf *Raft) nextTerm() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.persist()
-	log.Printf("#%v: %v $%v state updated, bump by last term", rf.currentTerm, rf.role, rf.me)
+	//log.Printf("#%v: %v $%v state updated, bump by last term", rf.currentTerm, rf.role, rf.me)
 	rf.mu.Unlock()
 
 	rf.duringElection()
@@ -147,7 +150,7 @@ func (rf *Raft) nextTerm() {
 func (rf *Raft) duringElection() {
 	// sanity check
 	if rf.role != "candidate" {
-		log.Panicf("%v during election", rf.role)
+		//log.Panicf("%v during election", rf.role)
 	}
 
 	rf.mu.Lock()
@@ -189,10 +192,13 @@ func (rf *Raft) duringElection() {
 					// fire the request
 					ok := rf.sendRequestVote(localIndex, &args, reply)
 					// check token
+					rf.mu.Lock()
 					if rf.role != token.role || rf.currentTerm != token.term {
+						rf.mu.Unlock()
 						voteStatus[localIndex] = "token-failed"
 						return
 					}
+					rf.mu.Unlock()
 					// network failed
 					if !ok {
 						voteStatus[localIndex] = "network-failed"
@@ -222,19 +228,22 @@ func (rf *Raft) duringElection() {
 
 	<-timeout
 	// check token
+	rf.mu.Lock()
 	if rf.role != token.role || rf.currentTerm != token.term {
+		rf.mu.Unlock()
 		return
 	}
-	log.Printf("#%v: %v $%v only got %v votes, status = %+v", rf.currentTerm, rf.role, rf.me, voteCollected, voteStatus)
+	rf.mu.Unlock()
+	//log.Printf("#%v: %v $%v only got %v votes, status = %+v", rf.currentTerm, rf.role, rf.me, voteCollected, voteStatus)
 	rf.nextTerm()
 }// }}}
 
 // leader phase
-func (rf *Raft) underLeading() {// {{{
+func (rf *Raft) underLeading() {
 	rf.mu.Lock()
 	// set role to leader
 	rf.role = "leader"
-	log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+	//log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 	// init nextIndex and matchIndex
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = len(rf.log)
@@ -277,7 +286,7 @@ func (rf *Raft) underLeading() {// {{{
 			pargs[index].Entries = rf.log[rf.nextIndex[index] : ]
 			rf.nextIndex[index] = len(rf.log)
 		}
-		log.Printf("#%v: %v $%v updated nextIndex = %v for everyone", rf.currentTerm, rf.role, rf.me, rf.nextIndex)
+		//log.Printf("#%v: %v $%v updated nextIndex = %v for everyone", rf.currentTerm, rf.role, rf.me, rf.nextIndex)
 		rf.mu.Unlock()
 
 		// heartbeat to every peer
@@ -289,9 +298,12 @@ func (rf *Raft) underLeading() {// {{{
 				reply := &AppendEntriesReply{}
 				ok := rf.sendAppendEntries(localIndex, &pargs[localIndex], reply)
 				// check token
+				rf.mu.Lock()
 				if token.role != rf.role || token.term != rf.currentTerm {
+					rf.mu.Unlock()
 					return
 				} 
+				rf.mu.Unlock()
 				// network failed
 				if !ok {
 					return
@@ -302,7 +314,7 @@ func (rf *Raft) underLeading() {// {{{
 					newMatchIndex := pargs[localIndex].PrevLogIndex + len(pargs[localIndex].Entries)
 					if newMatchIndex > rf.matchIndex[localIndex] {
 						rf.matchIndex[localIndex] = newMatchIndex
-						log.Printf("#%v: %v $%v updated matchIndex = %v for %v, append %v logs", rf.currentTerm, rf.role, rf.me, rf.matchIndex, localIndex, len(pargs[localIndex].Entries))
+						//log.Printf("#%v: %v $%v updated matchIndex = %v for %v, append %v logs", rf.currentTerm, rf.role, rf.me, rf.matchIndex, localIndex, len(pargs[localIndex].Entries))
 						rf.commitCond.Broadcast()
 					}
 				} else {
@@ -322,25 +334,31 @@ func (rf *Raft) underLeading() {// {{{
 					} else if reply.ConflictIndex != -1 {
 						rf.nextIndex[localIndex] = reply.ConflictIndex
 					}
-					log.Printf("#%v: %v $%v updated nextIndex = %v for %v", rf.currentTerm, rf.role, rf.me, rf.nextIndex, localIndex)
+					//log.Printf("#%v: %v $%v updated nextIndex = %v for %v", rf.currentTerm, rf.role, rf.me, rf.nextIndex, localIndex)
 				}
 				rf.mu.Unlock()
 			}(index)
 		}
 		<-timeout
 		// check token
+		rf.mu.Lock()
 		if token.role != rf.role || token.term != rf.currentTerm {
+			rf.mu.Unlock()
 			return
 		} 
+		rf.mu.Unlock()
 	}
 }// }}}
 
 // follower phase
 func (rf *Raft) waitForElection(token Token) {// {{{
 	// sanity check
+	rf.mu.Lock()
 	if rf.role != token.role || rf.currentTerm != token.term {
+		rf.mu.Unlock()
 		return
 	}
+	rf.mu.Unlock()
 
 	// set up sleep goroutine
 	timeout := setupSleep(time.Duration(rand.Intn(300) + 100) * time.Millisecond)
@@ -349,17 +367,23 @@ func (rf *Raft) waitForElection(token Token) {// {{{
 	select {
 	case <-timeout:
 		// check token
+		rf.mu.Lock()
 		if rf.role != token.role || rf.currentTerm != token.term {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
 		// move to next term
 		rf.nextTerm()
 		return
 	case <-rf.heartbeat:
 		// check token
+		rf.mu.Lock()
 		if rf.role != token.role || rf.currentTerm != token.term {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
 		// continue wating
 		rf.waitForElection(token)
 		return
@@ -394,7 +418,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = "follower"
 		rf.votedFor = -1
 		rf.persist()
-		log.Printf("#%v: %v $%v state updated, bump by RequestVote from %v", rf.currentTerm, rf.role, rf.me, args.CandidateID)
+		//log.Printf("#%v: %v $%v state updated, bump by RequestVote from %v", rf.currentTerm, rf.role, rf.me, args.CandidateID)
 		go rf.waitForElection(Token {rf.currentTerm, rf.role})
 	}
 	// if already voted and not for this peer, rejected
@@ -450,7 +474,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term == rf.currentTerm {
 		if rf.role == "candidate" {
 			rf.role = "follower"
-			log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+			//log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 			go rf.waitForElection(Token {rf.currentTerm, rf.role})
 		} else if rf.role == "follower" {
 			rf.heartbeat <- true
@@ -462,7 +486,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 		rf.persist()
-		log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+		//log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 		go rf.waitForElection(Token {rf.currentTerm, rf.role})
 	}
 	// don't have this index
@@ -500,7 +524,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Command: rf.log[i].Command,
 				CommandIndex: i + 1,
 			}
-			log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
+			//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 		}
 		rf.commitIndex = candidateCommitIndex
 	}
@@ -527,18 +551,19 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, isLeader)
 	// check for leading
+	rf.mu.Lock()
 	if rf.role != "leader" {
+		rf.mu.Unlock()
 		return -1, -1, false;
 	}
 	// append to local log
-	rf.mu.Lock();
 	rf.log = append(rf.log, Log{Term: rf.currentTerm, Command: command})
 	rf.persist()
 	index := len(rf.log) - 1
 	term := rf.currentTerm
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 	rf.nextIndex[rf.me] = len(rf.log)
-	log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index, command)
+	//log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index, command)
 	rf.mu.Unlock()
 	return index + 1, term, true
 }
@@ -569,11 +594,12 @@ func (rf *Raft) moniterCommit() {
 	rf.commitCond.L.Lock()
 	for !rf.killed() {
 		// check for leader
+		rf.mu.Lock()
 		if rf.role != "leader" {
+			rf.mu.Unlock()
 			rf.commitCond.Wait()
 			continue
 		}
-		rf.mu.Lock()
 		buf := make([]int, len(rf.peers))
 		copy(buf[:], rf.matchIndex)
 		sort.Ints(buf)
@@ -586,7 +612,7 @@ func (rf *Raft) moniterCommit() {
 					Command: rf.log[i].Command,
 					CommandIndex: i + 1,
 				}
-				log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
+				//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 				rf.commitIndex = i
 			}
 		}
@@ -602,7 +628,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	//log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 
 	rf.heartbeat = make(chan bool)	
 	rf.applyCh = applyCh
