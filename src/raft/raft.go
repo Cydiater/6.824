@@ -7,6 +7,7 @@ import (
 	"time"
 	"sort"
 	"bytes"
+	"log"
 
 	"../labrpc"
 	"../labgob"
@@ -140,7 +141,7 @@ func (rf *Raft) nextTerm() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.persist()
-	//log.Printf("#%v: %v $%v state updated, bump by last term", rf.currentTerm, rf.role, rf.me)
+	log.Printf("#%v: %v $%v state updated, bump by last term", rf.currentTerm, rf.role, rf.me)
 	rf.mu.Unlock()
 
 	rf.duringElection()
@@ -243,7 +244,7 @@ func (rf *Raft) underLeading() {
 	rf.mu.Lock()
 	// set role to leader
 	rf.role = "leader"
-	//log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+	log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 	// init nextIndex and matchIndex
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = len(rf.log)
@@ -418,7 +419,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.role = "follower"
 		rf.votedFor = -1
 		rf.persist()
-		//log.Printf("#%v: %v $%v state updated, bump by RequestVote from %v", rf.currentTerm, rf.role, rf.me, args.CandidateID)
+		log.Printf("#%v: %v $%v state updated, bump by RequestVote from %v", rf.currentTerm, rf.role, rf.me, args.CandidateID)
 		go rf.waitForElection(Token {rf.currentTerm, rf.role})
 	}
 	// if already voted and not for this peer, rejected
@@ -474,7 +475,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term == rf.currentTerm {
 		if rf.role == "candidate" {
 			rf.role = "follower"
-			//log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+			log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 			go rf.waitForElection(Token {rf.currentTerm, rf.role})
 		} else if rf.role == "follower" {
 			rf.heartbeat <- true
@@ -486,7 +487,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
 		rf.persist()
-		//log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
+		log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 		go rf.waitForElection(Token {rf.currentTerm, rf.role})
 	}
 	// don't have this index
@@ -605,18 +606,22 @@ func (rf *Raft) moniterCommit() {
 		sort.Ints(buf)
 		majorityIndex := (len(rf.peers) + 1) / 2 - 1
 		candidateIndex := buf[majorityIndex]
+		newMsgs := []ApplyMsg{}
 		if candidateIndex > rf.commitIndex && rf.log[candidateIndex].Term == rf.currentTerm {
 			for i := rf.commitIndex + 1; i <= candidateIndex; i++ {
-				rf.applyCh <- ApplyMsg {
+				newMsgs = append(newMsgs, ApplyMsg{
 					CommandValid: true,
 					Command: rf.log[i].Command,
 					CommandIndex: i + 1,
-				}
-				//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
+				})
 				rf.commitIndex = i
+				//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 			}
 		}
 		rf.mu.Unlock()
+		for _, msg := range newMsgs {
+			rf.applyCh <- msg
+		}
 		rf.commitCond.Wait()
 	}
 	rf.commitCond.L.Unlock()
