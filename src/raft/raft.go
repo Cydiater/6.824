@@ -352,7 +352,7 @@ func (rf *Raft) underLeading() {
 }// }}}
 
 // follower phase
-func (rf *Raft) waitForElection(token Token) {// {{{
+func (rf *Raft) waitForElection(token Token) {
 	// sanity check
 	rf.mu.Lock()
 	if rf.role != token.role || rf.currentTerm != token.term {
@@ -462,13 +462,13 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {// {{{
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.ConflictIndex = -1
 	reply.ConflictTerm = -1
 	// old request, useless
 	if args.Term < rf.currentTerm {
+		rf.mu.Unlock()
 		return
 	}
 	// leader in same term 
@@ -493,6 +493,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// don't have this index
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.ConflictIndex = len(rf.log)
+		rf.mu.Unlock()
 		return
 	}
 	// prev log index not match prev term
@@ -502,6 +503,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex - 1].Term == rf.log[reply.ConflictIndex].Term {
 			reply.ConflictIndex -= 1
 		}
+		rf.mu.Unlock()
 		return
 	}
 	// short the entries
@@ -517,20 +519,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries...)
 		rf.persist()
 	}
+	newMsgs := []ApplyMsg{}
 	candidateCommitIndex := min(args.LeaderCommit, len(rf.log) - 1)
 	if  candidateCommitIndex > rf.commitIndex {
 		for i := rf.commitIndex + 1; i <= candidateCommitIndex; i++ {
-			rf.applyCh <- ApplyMsg{
+			newMsgs = append(newMsgs, ApplyMsg{
 				CommandValid: true,
 				Command: rf.log[i].Command,
 				CommandIndex: i + 1,
-			}
+			})
 			//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 		}
 		rf.commitIndex = candidateCommitIndex
 	}
 	reply.Success = true;
-}// }}}
+	rf.mu.Unlock()
+	for _, msg := range newMsgs {
+		rf.applyCh <- msg
+	}
+}
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
