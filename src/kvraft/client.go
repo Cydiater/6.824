@@ -5,11 +5,13 @@ import "crypto/rand"
 import "math/big"
 import "time"
 import "log"
+import "github.com/google/uuid"
 
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	servers				[]*labrpc.ClientEnd
+	recentLeader	int
+	id						string
 }
 
 func nrand() int64 {
@@ -22,7 +24,8 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.recentLeader = 0
+	ck.id = uuid.NewString()
 	return ck
 }
 
@@ -39,32 +42,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	i := 0
+	i := ck.recentLeader
+	OpID := uuid.NewString()
 	for {
-		args := GetArgs { key }
-		reply := GetReply {  }
 		if i == len(ck.servers) {
 			i = 0
 		}
+		args := GetArgs { key, ck.id, OpID, i }
+		reply := GetReply {  }
 		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
 		if !ok {
-			i += 1
 			log.Printf("%v: Get with key %v failed: network", i, key)
+			i += 1
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		if reply.Err == "not leader" {
-			i += 1
 			log.Printf("%v: Get with key %v failed: not leader", i, key)
+			i += 1
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if reply.Err == "unknown err" {
-			log.Printf("%v: Get with key %v failed: unknown", i, key)
+		if reply.Err == "unknown err" || reply.Err == "not commit" {
+			log.Printf("%v: Get with key %v failed: %v", i, key, reply.Err)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		log.Printf("%v: Get with key %v sucess value = %v", i, key, reply.Value)
+		ck.recentLeader = i;
+		log.Printf("%v: Get with key %v sucess value = %v, OpID = %v", i, key, reply.Value, OpID)
 		return reply.Value
 	}
 }
@@ -80,32 +85,35 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	i := 0
+	i := ck.recentLeader
+	OpID := uuid.NewString()
 	for {
 		if i == len(ck.servers) {
 			i = 0
 		}
-		args := PutAppendArgs { key, value, op }
+		args := PutAppendArgs { key, value, op, ck.id, OpID, i }
 		reply := PutAppendReply {  }
+		log.Printf("i = %v args = %+v", i, args)
 		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 		if !ok {
-			i += 1
 			log.Printf("%v: PutAppend with (%v, %v, %v) failed: network", i, op, key, value)
+			i += 1
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		if reply.Err == "not leader" {
-			i += 1
 			log.Printf("%v: PutAppend with (%v, %v, %v) failed: not leader", i, op, key, value)
+			i += 1
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		if reply.Err == "unknown err" {
-			log.Printf("%v: PutAppend with (%v, %v, %v) failed: unknown", i, op, key, value)
+		if reply.Err == "unknown err" || reply.Err == "not commit" {
+			log.Printf("%v: PutAppend with (%v, %v, %v) failed: %v", i, op, key, value, reply.Err)
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		log.Printf("%v: PutAppend with (%v, %v, %v) success", i, op, key, value)
+		ck.recentLeader = i
+		log.Printf("%v: PutAppend with (%v, %v, %v) success OpID = %v", i, op, key, value, OpID)
 		return
 	}
 }

@@ -4,9 +4,11 @@ import (
 	"../labgob"
 	"../labrpc"
 	"log"
+	"context"
 	"../raft"
 	"sync"
 	"bytes"
+	"time"
 	"sync/atomic"
 	"github.com/google/uuid"
 )
@@ -29,6 +31,9 @@ type Op struct {
 	Key						string
 	Value					string
 	UUID					string
+	ClientID			string
+	ReplyTo				int
+	SessionID			string
 }
 
 type KVServer struct {
@@ -40,7 +45,10 @@ type KVServer struct {
 
 	maxraftstate	int // snapshot if log grows this big
 	kv						map[string]string
-	ansChan				map[string]chan struct {string; bool}
+	ansChan				map[string]chan struct {string; bool} // make a chan for each session
+	lastOpUUID		map[string]string
+	cancel				context.CancelFunc
+	lastApplied		raft.ApplyMsg
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -55,17 +63,60 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Action: "Get",
 		Key: args.Key,
 		Value: "",
-		UUID: uuid.NewString(),
+		UUID: args.OpID,
+		ClientID: args.ClientID,
+		ReplyTo: kv.me,
+		SessionID: uuid.NewString(),
 	}
-	kv.ansChan[op.UUID] = make(chan struct {string; bool})
-	c := kv.ansChan[op.UUID]
+	c := make(chan struct {string; bool}, 1)
+	kv.ansChan[op.SessionID] = c
 	kv.mu.Unlock()
-	kv.rf.Start(op.marshall())
-	res := <-c
-	reply.Err = "unknown err"
-	if res.bool {
-		reply.Err = "ok"
-		reply.Value = res.string;
+	index, term, ok := kv.rf.Start(op.marshall())
+	if !ok {
+		reply.Err = "not leader"
+		return
+	}
+	log.Printf("%v: start index = %v term = %v op = %+v", kv.me, index, term, op)
+	notify := make(chan bool)
+	go kv.checkCommit(term, op.UUID, index, notify)
+	select {
+	case res := <-c:
+		reply.Err = "unknown err"
+		if res.bool {
+			reply.Err = "ok"
+			reply.Value = res.string;
+		}
+	case <-notify:
+		log.Printf("%v: not commit %+v", kv.me, op)
+		reply.Err = "not commit"
+	}
+}
+
+func (kv *KVServer) checkCommit(term int, OpID string, commitIndex int, notify chan bool) {
+	for {
+		kv.mu.Lock()
+		currentTerm, is_leader := kv.rf.GetState()
+		if currentTerm != term || !is_leader {
+			kv.mu.Unlock()
+			notify <- true
+			return
+		}
+		if kv.lastApplied.CommandIndex > commitIndex {
+			kv.mu.Unlock()
+			notify <- true
+			return
+		}
+		if kv.lastApplied.CommandIndex == commitIndex {
+			op := Op {  }
+			op.unmarshall(kv.lastApplied.Command.([]byte))
+			kv.mu.Unlock()
+			if op.UUID != OpID {
+				notify <- true
+			}
+			return
+		}
+		kv.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -81,16 +132,31 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Action: args.Op,
 		Key: args.Key,
 		Value: args.Value,
-		UUID: uuid.NewString(),
+		UUID: args.OpID,
+		ClientID: args.ClientID,
+		ReplyTo: kv.me,
+		SessionID: uuid.NewString(),
 	}
-	kv.ansChan[op.UUID] = make(chan struct {string; bool})
-	c := kv.ansChan[op.UUID]
+	c := make(chan struct {string; bool}, 1)
+	kv.ansChan[op.SessionID] = c
 	kv.mu.Unlock()
-	kv.rf.Start(op.marshall())
-	res := <-c
-	reply.Err = "unknown err"
-	if res.bool {
-		reply.Err = "ok"
+	index, term, ok := kv.rf.Start(op.marshall())
+	if !ok {
+		reply.Err = "not leader"
+		return
+	}
+	log.Printf("%v: start index = %v term = %v op = %+v", kv.me, index, term, op)
+	notify := make(chan bool)
+	go kv.checkCommit(term, op.UUID, index, notify)
+	select {
+	case res := <-c:
+		reply.Err = "unknown err"
+		if res.bool {
+			reply.Err = "ok"
+		}
+	case <-notify:
+		log.Printf("%v: not commit %+v", kv.me, op)
+		reply.Err = "not commit"
 	}
 }
 
@@ -107,7 +173,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
+	kv.cancel()
+	log.Printf("%v: killed", kv.me)
 }
 
 func (kv *KVServer) killed() bool {
@@ -121,7 +188,10 @@ func (op *Op) marshall() []byte {
 	e.Encode(op.Action)
 	e.Encode(op.Key)
 	e.Encode(op.Value)
-	e.Encode(op.UUID);
+	e.Encode(op.UUID)
+	e.Encode(op.ClientID)
+	e.Encode(op.ReplyTo)
+	e.Encode(op.SessionID)
 	return buf.Bytes()
 }
 
@@ -132,10 +202,21 @@ func (op *Op) unmarshall(b []byte) {
 	d.Decode(&op.Key)
 	d.Decode(&op.Value)
 	d.Decode(&op.UUID)
+	d.Decode(&op.ClientID)
+	d.Decode(&op.ReplyTo)
+	d.Decode(&op.SessionID)
 }
 
-func (kv *KVServer) maintainKV() {
-	for apply := range kv.applyCh {
+func (kv *KVServer) maintainKV(ctx context.Context) {
+	var apply raft.ApplyMsg
+	for {
+		select {
+		case apply = <-kv.applyCh:
+		case <-ctx.Done():
+			log.Printf("%v: cancel", kv.me)
+			return
+		}
+		kv.lastApplied = apply
 		op := Op{}
 		b, ok := apply.Command.([]byte)
 		if !ok {
@@ -143,28 +224,53 @@ func (kv *KVServer) maintainKV() {
 		}
 		op.unmarshall(b)
 		kv.mu.Lock()
-		c, haveChan := kv.ansChan[op.UUID]
+		log.Printf("%v: applied index = %v op = %+v", kv.me, apply.CommandIndex, op)
 		if op.Action == "Get" {
 			v, ok := kv.kv[op.Key]
 			if !ok {
 				v = ""
 			}
-			if haveChan {
+			kv.lastOpUUID[op.ClientID] = op.UUID
+			if op.ReplyTo == kv.me {
+				c, ok := kv.ansChan[op.SessionID]
+				if !ok {
+					log.Panicf("%v: ansChan for %v not found", kv.me, op.SessionID)
+				}
 				c <- struct {string; bool} {v, true}
 			}
 		} else if op.Action == "Put" {
-			kv.kv[op.Key] = op.Value
-			if haveChan {
+			id, ok := kv.lastOpUUID[op.SessionID]
+			if !ok || op.UUID != id {
+				kv.kv[op.Key] = op.Value
+				kv.lastOpUUID[op.ClientID] = op.UUID
+			} else {
+				log.Printf("%v: skipped %+v", kv.me, op)
+			}
+			if op.ReplyTo == kv.me {
+				c, ok := kv.ansChan[op.SessionID]
+				if !ok {
+					log.Panicf("%v: ansChan for %v not found", kv.me, op.SessionID)
+				}
 				c <- struct {string; bool} {"", true}
 			}
 		} else if op.Action == "Append" {
-			v, ok := kv.kv[op.Key]
-			if !ok {
-				v = ""
-			} 
-			v += op.Value
-			kv.kv[op.Key] = v
-			if haveChan {
+			id, ok := kv.lastOpUUID[op.ClientID]
+			if !ok || op.UUID != id {
+				v, ok := kv.kv[op.Key]
+				if !ok {
+					v = ""
+				} 
+				v += op.Value
+				kv.kv[op.Key] = v
+				kv.lastOpUUID[op.ClientID] = op.UUID
+			} else {
+				log.Printf("%v: skipped %+v", kv.me, op)
+			}
+			if op.ReplyTo == kv.me {
+				c, ok := kv.ansChan[op.SessionID]
+				if !ok {
+					log.Panicf("%v: ansChan for %v not found", kv.me, op.SessionID)
+				}
 				c <- struct {string; bool} {"", true}
 			}
 		}
@@ -193,12 +299,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 	kv.kv = make(map[string]string)
+	kv.lastOpUUID = make(map[string]string)
 	kv.ansChan = make(map[string]chan struct {string; bool})
+	kv.lastApplied.CommandIndex = -1
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	var ctx context.Context
+	ctx, kv.cancel = context.WithCancel(context.Background())
 
-	go kv.maintainKV();
+	go kv.maintainKV(ctx)
 
 	return kv
 }
