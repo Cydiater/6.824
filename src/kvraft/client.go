@@ -69,7 +69,7 @@ func (ck *Clerk) Get(key string) string {
 			continue
 		}
 		ck.recentLeader = i;
-		log.Printf("%v: Get with key %v sucess value = %v, OpID = %v", i, key, reply.Value, OpID)
+		log.Printf("%v: Get with key %v success value = %v, OpID = %v", i, key, reply.Value, OpID)
 		return reply.Value
 	}
 }

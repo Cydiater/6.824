@@ -234,12 +234,15 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 			if op.ReplyTo == kv.me {
 				c, ok := kv.ansChan[op.SessionID]
 				if !ok {
-					log.Panicf("%v: ansChan for %v not found", kv.me, op.SessionID)
+					log.Printf("%v: ansChan for %v not found", kv.me, op.SessionID)
+					kv.mu.Unlock()
+					continue
 				}
 				c <- struct {string; bool} {v, true}
+				delete(kv.ansChan, op.SessionID)
 			}
 		} else if op.Action == "Put" {
-			id, ok := kv.lastOpUUID[op.SessionID]
+			id, ok := kv.lastOpUUID[op.ClientID]
 			if !ok || op.UUID != id {
 				kv.kv[op.Key] = op.Value
 				kv.lastOpUUID[op.ClientID] = op.UUID
@@ -249,9 +252,12 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 			if op.ReplyTo == kv.me {
 				c, ok := kv.ansChan[op.SessionID]
 				if !ok {
-					log.Panicf("%v: ansChan for %v not found", kv.me, op.SessionID)
+					log.Printf("%v: ansChan for %v not found", kv.me, op.SessionID)
+					kv.mu.Unlock()
+					continue
 				}
 				c <- struct {string; bool} {"", true}
+				delete(kv.ansChan, op.SessionID)
 			}
 		} else if op.Action == "Append" {
 			id, ok := kv.lastOpUUID[op.ClientID]
@@ -269,9 +275,12 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 			if op.ReplyTo == kv.me {
 				c, ok := kv.ansChan[op.SessionID]
 				if !ok {
-					log.Panicf("%v: ansChan for %v not found", kv.me, op.SessionID)
+					log.Printf("%v: ansChan for %v not found", kv.me, op.SessionID)
+					kv.mu.Unlock()
+					continue;
 				}
 				c <- struct {string; bool} {"", true}
+				delete(kv.ansChan, op.SessionID)
 			}
 		}
 		kv.mu.Unlock()
