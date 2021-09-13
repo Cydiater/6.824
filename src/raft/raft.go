@@ -13,7 +13,6 @@ import (
 	"../labgob"
 )
 
-// utils: min max setupSleep, latestLogIndexAndTerm, persist, GetState, readPersist {{{
 func min(a int, b int) int {
 	if a < b {
 		return a
@@ -52,6 +51,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.logOffset)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -73,19 +73,21 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logs []Log
+	var logOffset	int
 	if d.Decode(&currentTerm) != nil ||
 	   d.Decode(&votedFor) != nil ||
-		 d.Decode(&logs) != nil {
+		 d.Decode(&logs) != nil ||
+		 d.Decode(&logOffset) != nil {
 			 //log.Fatalf("decode failed")
 	 } else {
 	   rf.currentTerm = currentTerm
 	   rf.votedFor = votedFor
 		 rf.log = logs
+		 rf.logOffset = logOffset
 	}
 }
-// }}}
 
-type ApplyMsg struct {// {{{
+type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
@@ -121,6 +123,7 @@ type Raft struct {
 	votedFor			int							// -1 to indicate null
 	heartbeat			chan bool				// channel for heartbeat message 
 	log						[]Log
+	logOffset			int
 	commitIndex		int
 	lastApplied		int
 	commitCond		*sync.Cond
@@ -128,7 +131,7 @@ type Raft struct {
 	// leader only
 	nextIndex			[]int
 	matchIndex		[]int
-}// }}}
+}
 
 // switch to next term, start as candidate
 func (rf *Raft) nextTerm() { 
@@ -164,11 +167,11 @@ func (rf *Raft) duringElection() {
 	args := RequestVoteArgs {
 		Term: rf.currentTerm,
 		CandidateID: rf.me,
-		LastLogIndex: len(rf.log) - 1,
+		LastLogIndex: rf.real_log_size() - 1,
 		LastLogTerm: -1,
 	}
 	if args.LastLogIndex >= 0 {
-		args.LastLogTerm = rf.log[args.LastLogIndex].Term
+		args.LastLogTerm = rf.log_at(args.LastLogIndex).Term
 	}
 	rf.mu.Unlock()
 
@@ -237,7 +240,7 @@ func (rf *Raft) duringElection() {
 	rf.mu.Unlock()
 	//log.Printf("#%v: %v $%v only got %v votes, status = %+v", rf.currentTerm, rf.role, rf.me, voteCollected, voteStatus)
 	rf.nextTerm()
-}// }}}
+}//
 
 // leader phase
 func (rf *Raft) underLeading() {
@@ -247,11 +250,11 @@ func (rf *Raft) underLeading() {
 	log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 	// init nextIndex and matchIndex
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.real_log_size()
 		rf.matchIndex[i] = -1
 	}
-	rf.matchIndex[rf.me] = len(rf.log) - 1
-	rf.nextIndex[rf.me] = len(rf.log)
+	rf.matchIndex[rf.me] = rf.real_log_size() - 1
+	rf.nextIndex[rf.me] = rf.real_log_size()
 	// capture current state
 	token := Token {
 		term: rf.currentTerm,
@@ -282,10 +285,10 @@ func (rf *Raft) underLeading() {
 				LeaderCommit: rf.commitIndex,
 			}
 			if pargs[index].PrevLogIndex >= 0 {
-				pargs[index].PrevLogTerm = rf.log[pargs[index].PrevLogIndex].Term
+				pargs[index].PrevLogTerm = rf.log_at(pargs[index].PrevLogIndex).Term
 			}
-			pargs[index].Entries = rf.log[rf.nextIndex[index] : ]
-			rf.nextIndex[index] = len(rf.log)
+			pargs[index].Entries = rf.slice_log_suffix(rf.nextIndex[index])
+			rf.nextIndex[index] = rf.real_log_size()
 		}
 		//log.Printf("#%v: %v $%v updated nextIndex = %v for everyone", rf.currentTerm, rf.role, rf.me, rf.nextIndex)
 		rf.mu.Unlock()
@@ -323,7 +326,7 @@ func (rf *Raft) underLeading() {
 					if reply.ConflictTerm != -1 {
 						st := -1
 						for i := range rf.log {
-							if rf.log[i].Term == reply.ConflictTerm {
+							if rf.log_at(i).Term == reply.ConflictTerm {
 								st = i
 							}
 						}
@@ -349,7 +352,7 @@ func (rf *Raft) underLeading() {
 		} 
 		rf.mu.Unlock()
 	}
-}// }}}
+}
 
 // follower phase
 func (rf *Raft) waitForElection(token Token) {
@@ -389,7 +392,7 @@ func (rf *Raft) waitForElection(token Token) {
 		rf.waitForElection(token)
 		return
 	}
-}// }}}
+}
 
 type RequestVoteArgs struct {
 	Term					int		// term of the candidate
@@ -460,7 +463,35 @@ type AppendEntriesReply struct {
 	ConflictTerm	int
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {// {{{
+func (rf *Raft) log_at(idx int) Log {
+	if idx < rf.logOffset {
+		log.Panicf("access log at %v, but logOffset is %v", idx, rf.logOffset)
+	}
+	return rf.log[idx - rf.logOffset]
+}
+
+func (rf *Raft) real_log_size() int {
+	return len(rf.log) + rf.logOffset
+}
+
+func (rf *Raft) write_log_start_at(idx int, entires []Log) {
+	if idx < rf.logOffset {
+		log.Panicf("access log at %v, but logOffset is %v", idx, rf.logOffset)
+	}
+	idx -= rf.logOffset
+	rf.log = rf.log[ : idx]
+	rf.log = append(rf.log, entires...)
+}
+
+func (rf *Raft) slice_log_suffix(idx int) []Log {
+	if idx < rf.logOffset {
+		log.Panicf("access log at %v, but logOffset is %v", idx, rf.logOffset)
+	}
+	idx -= rf.logOffset
+	return rf.log[idx : ]
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -491,44 +522,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.waitForElection(Token {rf.currentTerm, rf.role})
 	}
 	// don't have this index
-	if args.PrevLogIndex >= len(rf.log) {
-		reply.ConflictIndex = len(rf.log)
+	if args.PrevLogIndex >= rf.real_log_size() {
+		reply.ConflictIndex = rf.real_log_size()
 		rf.mu.Unlock()
 		return
 	}
 	// prev log index not match prev term
-	if args.PrevLogIndex >= 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+	if args.PrevLogIndex >= 0 && rf.log_at(args.PrevLogIndex).Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log_at(args.PrevLogIndex).Term
 		reply.ConflictIndex = args.PrevLogIndex
-		for reply.ConflictIndex > 0 && rf.log[reply.ConflictIndex - 1].Term == rf.log[reply.ConflictIndex].Term {
+		for reply.ConflictIndex > 0 && rf.log_at(reply.ConflictIndex - 1).Term == rf.log_at(reply.ConflictIndex).Term {
 			reply.ConflictIndex -= 1
 		}
 		rf.mu.Unlock()
 		return
 	}
 	// short the entries
-	for len(args.Entries) > 0 && args.PrevLogIndex < len(rf.log) - 1 {
-		if args.PrevLogIndex != -1 && rf.log[args.PrevLogIndex + 1].Term != args.Entries[0].Term {
+	for len(args.Entries) > 0 && args.PrevLogIndex < rf.real_log_size() - 1 {
+		if args.PrevLogIndex != -1 && rf.log_at(args.PrevLogIndex + 1).Term != args.Entries[0].Term {
 			break
 		}
 		args.PrevLogIndex += 1
 		args.Entries = args.Entries[1 : ]
 	}
 	if len(args.Entries) > 0 {
-		rf.log = rf.log[ : args.PrevLogIndex + 1]
-		rf.log = append(rf.log, args.Entries...)
+		rf.write_log_start_at(args.PrevLogIndex + 1, args.Entries)
 		rf.persist()
 	}
 	newMsgs := []ApplyMsg{}
-	candidateCommitIndex := min(args.LeaderCommit, len(rf.log) - 1)
+	candidateCommitIndex := min(args.LeaderCommit, rf.real_log_size() - 1)
 	if  candidateCommitIndex > rf.commitIndex {
 		for i := rf.commitIndex + 1; i <= candidateCommitIndex; i++ {
 			newMsgs = append(newMsgs, ApplyMsg{
 				CommandValid: true,
-				Command: rf.log[i].Command,
+				Command: rf.log_at(i).Command,
 				CommandIndex: i + 1,
 			})
-			//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 		}
 		rf.commitIndex = candidateCommitIndex
 	}
@@ -567,10 +596,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, i
 	// append to local log
 	rf.log = append(rf.log, Log{Term: rf.currentTerm, Command: command})
 	rf.persist()
-	index := len(rf.log) - 1
+	index := rf.real_log_size() - 1
 	term := rf.currentTerm
-	rf.matchIndex[rf.me] = len(rf.log) - 1
-	rf.nextIndex[rf.me] = len(rf.log)
+	rf.matchIndex[rf.me] = rf.real_log_size() - 1
+	rf.nextIndex[rf.me] = rf.real_log_size()
 	//log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index, command)
 	rf.mu.Unlock()
 	return index + 1, term, true
@@ -614,15 +643,14 @@ func (rf *Raft) moniterCommit() {
 		majorityIndex := (len(rf.peers) + 1) / 2 - 1
 		candidateIndex := buf[majorityIndex]
 		newMsgs := []ApplyMsg{}
-		if candidateIndex > rf.commitIndex && rf.log[candidateIndex].Term == rf.currentTerm {
+		if candidateIndex > rf.commitIndex && rf.log_at(candidateIndex).Term == rf.currentTerm {
 			for i := rf.commitIndex + 1; i <= candidateIndex; i++ {
 				newMsgs = append(newMsgs, ApplyMsg{
 					CommandValid: true,
-					Command: rf.log[i].Command,
+					Command: rf.log_at(i).Command,
 					CommandIndex: i + 1,
 				})
 				rf.commitIndex = i
-				//log.Printf("%v $%v applied commit %v %v", rf.role, rf.me, i, rf.log[i].Command)
 			}
 		}
 		rf.mu.Unlock()
@@ -650,6 +678,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.votedFor = -1
 	rf.commitIndex = -1
 	rf.commitCond = sync.NewCond(new(sync.Mutex))
+	rf.logOffset = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -657,7 +686,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.real_log_size()
 		rf.matchIndex[i] = -1
 	}
 
