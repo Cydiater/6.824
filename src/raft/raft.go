@@ -221,7 +221,7 @@ func (rf *Raft) duringElection() {
 					}
 					voteStatus[localIndex] = "rejected"
 					// sleep and retry
-					time.Sleep(time.Millisecond * 10)
+					time.Sleep(time.Millisecond * 50)
 				}
 			}(index)
 		}
@@ -261,9 +261,13 @@ func (rf *Raft) underLeading() {
 
 	for !rf.killed() {
 		// check token
+		rf.mu.Lock()
 		if rf.role != token.role || rf.currentTerm != token.term {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
+
 		// setup sleep 
 		timeout := setupSleep(time.Duration(50) * time.Millisecond)
 
@@ -353,14 +357,6 @@ func (rf *Raft) underLeading() {
 
 // follower phase
 func (rf *Raft) waitForElection(token Token) {
-	// sanity check
-	rf.mu.Lock()
-	if rf.role != token.role || rf.currentTerm != token.term {
-		rf.mu.Unlock()
-		return
-	}
-	rf.mu.Unlock()
-
 	// set up sleep goroutine
 	timeout := setupSleep(time.Duration(rand.Intn(300) + 100) * time.Millisecond)
 
@@ -478,7 +474,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 			go rf.waitForElection(Token {rf.currentTerm, rf.role})
 		} else if rf.role == "follower" {
-			rf.heartbeat <- true
+			// not block
+			go func() {
+				rf.heartbeat <- true
+			}()
 		}
 	}
 	// bigger term
@@ -640,7 +639,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	//log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 
 	rf.heartbeat = make(chan bool)	
 	rf.applyCh = applyCh
