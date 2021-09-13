@@ -2,3 +2,6 @@ pkg/
 api.key
 *-handin.tar.gz
 .DS_Store
+**.log
+**/go.mod
+**/go.sum
