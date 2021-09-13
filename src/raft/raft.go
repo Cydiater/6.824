@@ -142,6 +142,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	applyCh		chan ApplyMsg
+	applyMu		sync.Mutex
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -266,7 +267,7 @@ func (rf *Raft) duringElection() {
 		return
 	}
 	rf.mu.Unlock()
-	//log.Printf("#%v: %v $%v only got %v votes, status = %+v", rf.currentTerm, rf.role, rf.me, voteCollected, voteStatus)
+	//log.Printf("#%v: %v $%v only got %v votes", rf.currentTerm, rf.role, rf.me, voteCollected)
 	rf.nextTerm()
 }//
 
@@ -602,9 +603,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	reply.Success = true;
 	rf.mu.Unlock()
-	for _, msg := range newMsgs {
-		rf.applyCh <- msg
-	}
+	go func() {
+		rf.applyMu.Lock()
+		for _, msg := range newMsgs {
+			rf.applyCh <- msg
+		}
+		rf.applyMu.Unlock()
+	}()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -683,9 +688,11 @@ func (rf *Raft) moniterCommit() {
 			}
 		}
 		rf.mu.Unlock()
+		rf.applyMu.Lock()
 		for _, msg := range newMsgs {
 			rf.applyCh <- msg
 		}
+		rf.applyMu.Unlock()
 		rf.commitCond.Wait()
 	}
 	rf.commitCond.L.Unlock()
