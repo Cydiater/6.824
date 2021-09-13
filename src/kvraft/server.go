@@ -46,7 +46,7 @@ type KVServer struct {
 	maxraftstate	int // snapshot if log grows this big
 	kv						map[string]string
 	ansChan				map[string]chan struct {string; bool} // make a chan for each session
-	lastOpUUID		map[string]string
+	lastOpUUID		map[string]string // store last operation for each client
 	cancel				context.CancelFunc
 	lastApplied		raft.ApplyMsg
 }
@@ -207,6 +207,14 @@ func (op *Op) unmarshall(b []byte) {
 	d.Decode(&op.SessionID)
 }
 
+func (kv *KVServer) takeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kv)
+	e.Encode(kv.lastOpUUID)
+	return w.Bytes()
+}
+
 func (kv *KVServer) maintainKV(ctx context.Context) {
 	var apply raft.ApplyMsg
 	for {
@@ -215,6 +223,22 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 		case <-ctx.Done():
 			log.Printf("%v: cancel", kv.me)
 			return
+		}
+		if !apply.CommandValid {
+			if apply.CommandType == "ReportStateSize" {
+				if kv.maxraftstate == -1 {
+					continue
+				}
+				if apply.Command.(int) >= kv.maxraftstate {
+					kv.mu.Lock()
+					b := kv.takeSnapshot()
+					kv.rf.UpdateLogOffset(apply.CommandIndex, b)
+					kv.mu.Unlock()
+				}
+			} else if apply.CommandType == "InstallSnapshot" {
+
+			}
+			continue
 		}
 		kv.lastApplied = apply
 		op := Op{}

@@ -45,15 +45,41 @@ func (rf *Raft) latestLogIndexAndTerm() (int, int) {
 	return index, term
 }
 
-func (rf *Raft) persist() {
+func (rf *Raft) marshallState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	e.Encode(rf.logOffset)
-	data := w.Bytes()
+	return w.Bytes()
+}
+
+func (rf *Raft) persist() {
+	data := rf.marshallState()
 	rf.persister.SaveRaftState(data)
+	/*rf.applyCh <- ApplyMsg {
+		CommandValid: false,
+		Command: rf.persister.RaftStateSize(),
+		CommandIndex: rf.commitIndex + 1,
+		CommandType: "ReportStateSize",
+	}*/
+}
+
+func (rf *Raft) UpdateLogOffset(commandIndex int, b []byte) {
+	rf.mu.Lock()
+	newLogOffset := commandIndex
+	if newLogOffset < rf.logOffset {
+		log.Panicf("new log offset %v is smaller than current log offset %v", newLogOffset, rf.logOffset)
+	}
+	if newLogOffset - rf.logOffset > len(rf.log) {
+		log.Panicf("don't have enough log to update log offset from %v to %v", rf.logOffset, newLogOffset)
+	}
+	rf.persister.SaveStateAndSnapshot(rf.marshallState(), b)
+	// don't touch new log
+	rf.log = rf.log[newLogOffset - rf.logOffset : ]
+	rf.logOffset = newLogOffset
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -91,6 +117,8 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	/* Available Types: Apply ReportStateSize InstallSnapshot */
+	CommandType	 string
 }
 
 type BumpMsg struct {
@@ -447,6 +475,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	Term							int
+	LastIncludedIndex	int
+	LastIncludedTerm	int
+	Body							[]byte
+}
+
+type InstallSnapshotReply struct {
+	Term					int
+}
+
 type AppendEntriesArgs struct {
 	Term					int
 	LeaderId			int
@@ -557,6 +596,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				CommandValid: true,
 				Command: rf.log_at(i).Command,
 				CommandIndex: i + 1,
+				CommandType: "Apply",
 			})
 		}
 		rf.commitIndex = candidateCommitIndex
@@ -605,17 +645,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, i
 	return index + 1, term, true
 }
 
-//
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -649,6 +678,7 @@ func (rf *Raft) moniterCommit() {
 					CommandValid: true,
 					Command: rf.log_at(i).Command,
 					CommandIndex: i + 1,
+					CommandType: "Apply",
 				})
 				rf.commitIndex = i
 			}
