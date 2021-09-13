@@ -7,3 +7,5 @@ mrtmp.*
 /kvpaxos/x.txt
 *.so
 **.log
+**/go.mod
+**/go.sum
