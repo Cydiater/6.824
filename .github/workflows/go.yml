@@ -22,8 +22,13 @@ jobs:
       run: |
         go env -w GO111MODULE=off
         go get github.com/google/uuid
-
-    - name: Test
+        
+    - name: Lab 1
       run: |
         cd src/main
         sh test-mr.sh |& tee ~/mr.log
+        
+    - name: Lab 2
+      run: |
+        cd src/raft
+        go test
