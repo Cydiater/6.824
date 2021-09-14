@@ -58,12 +58,16 @@ func (rf *Raft) marshallState() []byte {
 func (rf *Raft) persist() {
 	data := rf.marshallState()
 	rf.persister.SaveRaftState(data)
-	/*rf.applyCh <- ApplyMsg {
-		CommandValid: false,
-		Command: rf.persister.RaftStateSize(),
-		CommandIndex: rf.commitIndex + 1,
-		CommandType: "ReportStateSize",
-	}*/
+	go func() {
+		rf.applyMu.Lock()
+		rf.applyCh <- ApplyMsg {
+			CommandValid: false,
+			Command: rf.persister.RaftStateSize(),
+			CommandIndex: rf.commitIndex + 1,
+			CommandType: "ReportStateSize",
+		}
+		rf.applyMu.Unlock()
+	}()
 }
 
 func (rf *Raft) UpdateLogOffset(commandIndex int, b []byte) {
@@ -154,7 +158,7 @@ type Raft struct {
 	log						[]Log
 	logOffset			int
 	commitIndex		int
-	lastApplied		int
+	applyIndex		int
 	commitCond		*sync.Cond
 
 	// leader only
@@ -604,9 +608,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true;
 	rf.mu.Unlock()
 	go func() {
-		rf.applyMu.Lock()
+		for {
+			if len(newMsgs) == 0 {
+				return
+			}
+			rf.applyMu.Lock()
+			if rf.applyIndex + 1 == newMsgs[0].CommandIndex {
+				break
+			}
+			rf.applyMu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
 		for _, msg := range newMsgs {
 			rf.applyCh <- msg
+			rf.applyIndex = msg.CommandIndex
 		}
 		rf.applyMu.Unlock()
 	}()
@@ -688,9 +703,20 @@ func (rf *Raft) moniterCommit() {
 			}
 		}
 		rf.mu.Unlock()
-		rf.applyMu.Lock()
+		for {
+			rf.applyMu.Lock()
+			if len(newMsgs) == 0 {
+				break
+			}
+			if rf.applyIndex + 1 == newMsgs[0].CommandIndex {
+				break
+			}
+			rf.applyMu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+		}
 		for _, msg := range newMsgs {
 			rf.applyCh <- msg
+			rf.applyIndex = msg.CommandIndex
 		}
 		rf.applyMu.Unlock()
 		rf.commitCond.Wait()
@@ -715,6 +741,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.commitIndex = -1
 	rf.commitCond = sync.NewCond(new(sync.Mutex))
 	rf.logOffset = 0
+	rf.applyIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
