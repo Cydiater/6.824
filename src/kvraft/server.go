@@ -240,7 +240,6 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 			}
 			continue
 		}
-		kv.lastApplied = apply
 		op := Op{}
 		b, ok := apply.Command.([]byte)
 		if !ok {
@@ -248,6 +247,7 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 		}
 		op.unmarshall(b)
 		kv.mu.Lock()
+		kv.lastApplied = apply
 		log.Printf("%v: applied index = %v op = %+v", kv.me, apply.CommandIndex, op)
 		if op.Action == "Get" {
 			v, ok := kv.kv[op.Key]
