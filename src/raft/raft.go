@@ -388,6 +388,9 @@ func (rf *Raft) underLeading(token Token) {
 					} else if reply.ConflictIndex != -1 {
 						rf.nextIndex[localIndex] = reply.ConflictIndex
 					}
+					if rf.nextIndex[localIndex] > rf.real_log_size() {
+						log.Panicf("set nextIndex larger than log")
+					}
 					//log.Printf("#%v: %v $%v updated nextIndex = %v for %v", rf.currentTerm, rf.role, rf.me, rf.nextIndex, localIndex)
 				}
 				rf.mu.Unlock()
@@ -569,6 +572,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			go func() {
 				rf.heartbeat <- true
 			}()
+		} else if rf.role == "leader" {
+			log.Panicf("leader received AppendEntries from same term")
 		}
 	}
 	// bigger term
