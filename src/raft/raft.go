@@ -346,6 +346,13 @@ func (rf *Raft) underLeading(token Token) {
 			}
 			go func(localIndex int) {
 				reply := &AppendEntriesReply{}
+				// check token
+				rf.mu.Lock()
+				if token.role != rf.role || token.term != rf.currentTerm {
+					rf.mu.Unlock()
+					return
+				} 
+				rf.mu.Unlock()
 				ok := rf.sendAppendEntries(localIndex, &pargs[localIndex], reply)
 				// check token
 				rf.mu.Lock()
