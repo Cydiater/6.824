@@ -173,6 +173,7 @@ func (cfg *config) start1(i int) {
 				// ignore other types of ApplyMsg
 			} else {
 				v := m.Command
+				log.Printf("%v applied command index %v", i, m.CommandIndex - 1)
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
@@ -445,6 +446,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
+					log.Printf("start cmd %v with index %v", cmd, index)
 					break
 				}
 			}
@@ -467,12 +469,14 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
+				log.Printf("failed")
 				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+	log.Printf("failed")
 	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	return -1
 }

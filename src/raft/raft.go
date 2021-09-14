@@ -58,16 +58,6 @@ func (rf *Raft) marshallState() []byte {
 func (rf *Raft) persist() {
 	data := rf.marshallState()
 	rf.persister.SaveRaftState(data)
-	go func() {
-		rf.applyMu.Lock()
-		rf.applyCh <- ApplyMsg {
-			CommandValid: false,
-			Command: rf.persister.RaftStateSize(),
-			CommandIndex: rf.commitIndex + 1,
-			CommandType: "ReportStateSize",
-		}
-		rf.applyMu.Unlock()
-	}()
 }
 
 func (rf *Raft) UpdateLogOffset(commandIndex int, b []byte) {
@@ -146,7 +136,6 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 	applyCh		chan ApplyMsg
-	applyMu		sync.Mutex
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -159,7 +148,6 @@ type Raft struct {
 	logOffset			int
 	commitIndex		int
 	applyIndex		int
-	commitCond		*sync.Cond
 
 	// leader only
 	nextIndex			[]int
@@ -167,36 +155,39 @@ type Raft struct {
 }
 
 // switch to next term, start as candidate
-func (rf *Raft) nextTerm() { 
+func (rf *Raft) nextTerm(token Token) { 
 	if rf.killed() {
 		return
 	}
 
 	rf.mu.Lock()
+	if rf.role != token.role || rf.currentTerm != token.term {
+		rf.mu.Unlock()
+		return
+	}
 	rf.role = "candidate"
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	token = Token {
+		term: rf.currentTerm,
+		role: rf.role,
+	}
 	rf.persist()
 	log.Printf("#%v: %v $%v state updated, bump by last term", rf.currentTerm, rf.role, rf.me)
 	rf.mu.Unlock()
 
-	rf.duringElection()
+	rf.duringElection(token)
 } 
 
 // candidate phase
-func (rf *Raft) duringElection() {
-	// sanity check
-	if rf.role != "candidate" {
-		//log.Panicf("%v during election", rf.role)
-	}
+func (rf *Raft) duringElection(token Token) {
 
 	rf.mu.Lock()
-	// setup token
-	token := Token {
-		term: rf.currentTerm,
-		role: rf.role,
+	// check token
+	if rf.currentTerm != token.term || rf.role != token.role {
+		rf.mu.Unlock()
+		return
 	}
-	// prepare args
 	args := RequestVoteArgs {
 		Term: rf.currentTerm,
 		CandidateID: rf.me,
@@ -214,15 +205,12 @@ func (rf *Raft) duringElection() {
 	// request vote from every peer
 	var voteCollected int64
 	voteCollected = 1
-	voteStatus := make([]string, len(rf.peers))
 	go func() {
 		for index := range rf.peers {
 			// no need for self
 			if index == rf.me {
-				voteStatus[index] = "ok"
 				continue
 			}
-			voteStatus[index] = "send"
 			go func (localIndex int) {
 				for !rf.killed() {
 					reply := &RequestVoteReply{}
@@ -232,30 +220,22 @@ func (rf *Raft) duringElection() {
 					rf.mu.Lock()
 					if rf.role != token.role || rf.currentTerm != token.term {
 						rf.mu.Unlock()
-						voteStatus[localIndex] = "token-failed"
 						return
 					}
 					rf.mu.Unlock()
-					// network failed
-					if !ok {
-						voteStatus[localIndex] = "network-failed"
-						continue
-					}
 					// vote granted, done
-					if reply.VoteGranted {
+					if ok && reply.VoteGranted {
 						// increase counter
 						rf.mu.Lock()
 						atomic.AddInt64(&voteCollected, 1)
-						voteStatus[localIndex] = "ok"
 						if int(voteCollected * 2) > len(rf.peers) && rf.role == token.role && rf.currentTerm == token.term {
 							rf.mu.Unlock()
-							rf.underLeading()
+							rf.underLeading(token)
 							return
 						}
 						rf.mu.Unlock()
 						return
 					}
-					voteStatus[localIndex] = "rejected"
 					// sleep and retry
 					time.Sleep(time.Millisecond * 50)
 				}
@@ -271,14 +251,40 @@ func (rf *Raft) duringElection() {
 		return
 	}
 	rf.mu.Unlock()
-	//log.Printf("#%v: %v $%v only got %v votes", rf.currentTerm, rf.role, rf.me, voteCollected)
-	rf.nextTerm()
-}//
+	rf.nextTerm(token)
+}
+
+func (rf *Raft) tryUpdateCommitIndex() {
+	// check
+	if rf.role != "leader" {
+		log.Panicf("%v try update commit index", rf.role)
+	}
+	// find the median match index
+	tmpMatchIndex := make([]int, len(rf.peers))
+	copy(tmpMatchIndex, rf.matchIndex)
+	sort.Ints(tmpMatchIndex)
+	pos := len(rf.peers) / 2
+	candidateCommitIndex := tmpMatchIndex[pos]
+	// candidate commit index can be small, since 
+	// a new leader from candidate know nothing 
+	// about match index
+	if candidateCommitIndex > rf.commitIndex {
+		// check same term
+		if rf.log_at(candidateCommitIndex).Term == rf.currentTerm {
+			log.Printf("#%v: %v $%v update commitIndex from %v to %v", rf.currentTerm, rf.role, rf.me, rf.commitIndex, candidateCommitIndex)
+			rf.commitIndex = candidateCommitIndex
+		}
+	}
+}
 
 // leader phase
-func (rf *Raft) underLeading() {
+func (rf *Raft) underLeading(token Token) {
 	rf.mu.Lock()
 	// set role to leader
+	if rf.currentTerm != token.term || rf.role != token.role {
+		rf.mu.Unlock()
+		return
+	}
 	rf.role = "leader"
 	log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 	// init nextIndex and matchIndex
@@ -289,10 +295,11 @@ func (rf *Raft) underLeading() {
 	rf.matchIndex[rf.me] = rf.real_log_size() - 1
 	rf.nextIndex[rf.me] = rf.real_log_size()
 	// capture current state
-	token := Token {
+	token = Token {
 		term: rf.currentTerm,
 		role: rf.role,
 	}
+	me := rf.me
 	rf.mu.Unlock()
 
 	for !rf.killed() {
@@ -331,6 +338,8 @@ func (rf *Raft) underLeading() {
 		rf.mu.Unlock()
 
 		// heartbeat to every peer
+		var successCount int32
+		successCount = 1
 		for index := range rf.peers {
 			if index == rf.me {
 				continue
@@ -349,14 +358,18 @@ func (rf *Raft) underLeading() {
 				if !ok {
 					return
 				}
-				// got reply
+				// check token
 				rf.mu.Lock()
+				if token.role != rf.role || token.term != rf.currentTerm {
+					rf.mu.Unlock()
+					return
+				} 
 				if (reply.Success) {
+					atomic.AddInt32(&successCount, 1)
 					newMatchIndex := pargs[localIndex].PrevLogIndex + len(pargs[localIndex].Entries)
 					if newMatchIndex > rf.matchIndex[localIndex] {
 						rf.matchIndex[localIndex] = newMatchIndex
-						//log.Printf("#%v: %v $%v updated matchIndex = %v for %v, append %v logs", rf.currentTerm, rf.role, rf.me, rf.matchIndex, localIndex, len(pargs[localIndex].Entries))
-						rf.commitCond.Broadcast()
+						rf.tryUpdateCommitIndex()
 					}
 				} else {
 					rf.nextIndex[localIndex] = max(pargs[localIndex].PrevLogIndex, 0)
@@ -381,13 +394,7 @@ func (rf *Raft) underLeading() {
 			}(index)
 		}
 		<-timeout
-		// check token
-		rf.mu.Lock()
-		if token.role != rf.role || token.term != rf.currentTerm {
-			rf.mu.Unlock()
-			return
-		} 
-		rf.mu.Unlock()
+		log.Printf("#%v: %v $%v finished %v heartbeats", token.term, token.role, me, atomic.LoadInt32(&successCount))
 	}
 }
 
@@ -407,7 +414,7 @@ func (rf *Raft) waitForElection(token Token) {
 		}
 		rf.mu.Unlock()
 		// move to next term
-		rf.nextTerm()
+		rf.nextTerm(token)
 		return
 	case <-rf.heartbeat:
 		// check token
@@ -531,6 +538,15 @@ func (rf *Raft) slice_log_suffix(idx int) []Log {
 	return rf.log[idx : ]
 }
 
+func (rf *Raft) slice_log(l int, r int) []Log {
+	if l < rf.logOffset || r < rf.logOffset || l >= r || r > len(rf.log) + rf.logOffset {
+		log.Panicf("l = %v r = %v log offset = %v len(log) = %v", l, r, rf.logOffset, len(rf.log))
+	}
+	l -= rf.logOffset
+	r -= rf.logOffset
+	return rf.log[l : r]
+}
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
@@ -549,7 +565,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			log.Printf("#%v: %v $%v state updated", rf.currentTerm, rf.role, rf.me)
 			go rf.waitForElection(Token {rf.currentTerm, rf.role})
 		} else if rf.role == "follower" {
-			// not block
+			// heartbeat, not block since it's not too bad for a wrong heartbeat
 			go func() {
 				rf.heartbeat <- true
 			}()
@@ -592,39 +608,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.write_log_start_at(args.PrevLogIndex + 1, args.Entries)
 		rf.persist()
 	}
-	newMsgs := []ApplyMsg{}
+	// update commit index
 	candidateCommitIndex := min(args.LeaderCommit, rf.real_log_size() - 1)
-	if  candidateCommitIndex > rf.commitIndex {
-		for i := rf.commitIndex + 1; i <= candidateCommitIndex; i++ {
-			newMsgs = append(newMsgs, ApplyMsg{
-				CommandValid: true,
-				Command: rf.log_at(i).Command,
-				CommandIndex: i + 1,
-				CommandType: "Apply",
-			})
-		}
+	if candidateCommitIndex > rf.commitIndex {
 		rf.commitIndex = candidateCommitIndex
 	}
 	reply.Success = true;
 	rf.mu.Unlock()
-	go func() {
-		for {
-			if len(newMsgs) == 0 {
-				return
-			}
-			rf.applyMu.Lock()
-			if rf.applyIndex + 1 == newMsgs[0].CommandIndex {
-				break
-			}
-			rf.applyMu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-		}
-		for _, msg := range newMsgs {
-			rf.applyCh <- msg
-			rf.applyIndex = msg.CommandIndex
-		}
-		rf.applyMu.Unlock()
-	}()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -659,7 +649,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { // (index, term, i
 	term := rf.currentTerm
 	rf.matchIndex[rf.me] = rf.real_log_size() - 1
 	rf.nextIndex[rf.me] = rf.real_log_size()
-	//log.Printf("#%v: %v $%v updated matchIndex = %v with new command %v %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index, command)
+	log.Printf("#%v: %v $%v updated matchIndex = %v with new command index %v", rf.currentTerm, rf.role, rf.me, rf.matchIndex, index)
 	rf.mu.Unlock()
 	return index + 1, term, true
 }
@@ -674,54 +664,31 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// just for leader, check for new commit index
-func (rf *Raft) moniterCommit() {
-	rf.commitCond.L.Lock()
+func (rf *Raft) maintainApply() {
 	for !rf.killed() {
-		// check for leader
 		rf.mu.Lock()
-		if rf.role != "leader" {
+		// no log need to be applied
+		if rf.applyIndex >= rf.commitIndex {
 			rf.mu.Unlock()
-			rf.commitCond.Wait()
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		buf := make([]int, len(rf.peers))
-		copy(buf[:], rf.matchIndex)
-		sort.Ints(buf)
-		majorityIndex := (len(rf.peers) + 1) / 2 - 1
-		candidateIndex := buf[majorityIndex]
-		newMsgs := []ApplyMsg{}
-		if candidateIndex > rf.commitIndex && rf.log_at(candidateIndex).Term == rf.currentTerm {
-			for i := rf.commitIndex + 1; i <= candidateIndex; i++ {
-				newMsgs = append(newMsgs, ApplyMsg{
-					CommandValid: true,
-					Command: rf.log_at(i).Command,
-					CommandIndex: i + 1,
-					CommandType: "Apply",
-				})
-				rf.commitIndex = i
-			}
-		}
+		newLogs := rf.slice_log(rf.applyIndex + 1, rf.commitIndex + 1)
+		log.Printf("#%v: %v $%v start applying %v logs from %v", rf.currentTerm, rf.role, rf.me, len(newLogs), rf.applyIndex)
 		rf.mu.Unlock()
-		for {
-			rf.applyMu.Lock()
-			if len(newMsgs) == 0 {
-				break
+		// apply new log
+		for _, newLog := range newLogs {
+			rf.applyCh <- ApplyMsg {
+				CommandValid: true,
+				Command: newLog.Command,
+				CommandIndex: rf.applyIndex + 1 + 1, // adjust and next
+				CommandType: "Apply",
 			}
-			if rf.applyIndex + 1 == newMsgs[0].CommandIndex {
-				break
-			}
-			rf.applyMu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			// advance apply index
+			rf.applyIndex += 1
 		}
-		for _, msg := range newMsgs {
-			rf.applyCh <- msg
-			rf.applyIndex = msg.CommandIndex
-		}
-		rf.applyMu.Unlock()
-		rf.commitCond.Wait()
+		// no need to sleep
 	}
-	rf.commitCond.L.Unlock()
 }
 
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -731,6 +698,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
+	log.Printf("RESTART %v", me)
 
 	rf.heartbeat = make(chan bool)	
 	rf.applyCh = applyCh
@@ -739,9 +707,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = -1
-	rf.commitCond = sync.NewCond(new(sync.Mutex))
+	rf.applyIndex = -1
 	rf.logOffset = 0
-	rf.applyIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -754,7 +721,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 
 	go rf.waitForElection(Token {rf.currentTerm, rf.role})
-	go rf.moniterCommit()
+	go rf.maintainApply()
 
 	return rf
 }
