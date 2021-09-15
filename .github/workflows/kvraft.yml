@@ -1,4 +1,4 @@
-name: Raft
+name: KVRaft
 
 on:
   push:
@@ -23,8 +23,8 @@ jobs:
         go env -w GO111MODULE=off
         go get github.com/google/uuid
         
-    - name: Lab 2
+    - name: Lab 3
       run: |
-        cd src/raft
+        cd src/kvraft
         go test -race
         cd ../..
