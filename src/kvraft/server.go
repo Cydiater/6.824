@@ -212,8 +212,32 @@ func (kv *KVServer) takeSnapshot() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kv)
 	e.Encode(kv.lastOpUUID)
+	e.Encode(kv.lastApplied)
 	return w.Bytes()
 }
+
+func (kv *KVServer) applySnapshot(b []byte) {
+	if len(b) == 0 {
+		return
+	}
+	w := bytes.NewBuffer(b)
+	d := labgob.NewDecoder(w)
+	var core map[string]string
+	var lastOpUUID map[string]string
+	var lastApplied raft.ApplyMsg
+	if	d.Decode(&core) != nil ||
+			d.Decode(&lastOpUUID) != nil  || 
+			d.Decode(&lastApplied) != nil {
+		log.Fatalf("decode failed")
+	} else {
+		kv.mu.Lock()
+		kv.kv = core
+		kv.lastOpUUID = lastOpUUID
+		kv.lastApplied = lastApplied
+		log.Printf("$%v: snapshot installed, last applied index = %v", kv.me, kv.lastApplied.CommandIndex - 1)
+		kv.mu.Unlock()
+	}
+} 
 
 func (kv *KVServer) maintainKV(ctx context.Context) {
 	var apply raft.ApplyMsg
@@ -225,18 +249,22 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 			return
 		}
 		if !apply.CommandValid {
-			if apply.CommandType == "ReportStateSize" {
+			if apply.CommandType == "InstallSnapshot" {
+				kv.applySnapshot(apply.Command.([]byte))
+				kv.rf.StateChangingFinished()
+			} else if apply.CommandType == "ReportStateSize" {
 				if kv.maxraftstate == -1 {
 					continue
 				}
 				if apply.Command.(int) >= kv.maxraftstate {
+					log.Printf("$%v: reported state size = %v at index %v", kv.me, apply.Command.(int), kv.lastApplied.CommandIndex)
 					kv.mu.Lock()
 					b := kv.takeSnapshot()
-					kv.rf.UpdateLogOffset(apply.CommandIndex, b)
+					kv.rf.UpdateLogOffset(kv.lastApplied.CommandIndex, b)
 					kv.mu.Unlock()
 				}
-			} else if apply.CommandType == "InstallSnapshot" {
-
+			 } else {
+				log.Panicf("unknown command %v", apply.CommandType)
 			}
 			continue
 		}
@@ -247,6 +275,9 @@ func (kv *KVServer) maintainKV(ctx context.Context) {
 		}
 		op.unmarshall(b)
 		kv.mu.Lock()
+		if apply.CommandIndex - 1 != kv.lastApplied.CommandIndex {
+			log.Panicf("$%v: applied index = %v, but last applied index = %v", kv.me, apply.CommandIndex - 1, kv.lastApplied.CommandIndex - 1)
+		}
 		kv.lastApplied = apply
 		log.Printf("%v: applied index = %v op = %+v", kv.me, apply.CommandIndex, op)
 		if op.Action == "Get" {
@@ -334,12 +365,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kv = make(map[string]string)
 	kv.lastOpUUID = make(map[string]string)
 	kv.ansChan = make(map[string]chan struct {string; bool})
-	kv.lastApplied.CommandIndex = -1
+	kv.lastApplied.CommandIndex = 0
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	var ctx context.Context
 	ctx, kv.cancel = context.WithCancel(context.Background())
+
+	kv.applySnapshot(persister.ReadSnapshot())
 
 	go kv.maintainKV(ctx)
 
