@@ -411,9 +411,11 @@ func (rf *Raft) underLeading(token Token) {
 					rf.mu.Unlock()
 					return
 				} 
-				rf.mu.Unlock()
 				if pargs[localIndex] == nil {
 					log.Printf("#%v: %v $%v send InstallSnapshot to %v, LastIncludedIndex = %v", rf.currentTerm, rf.role, rf.me, localIndex, sarg.LastIncludedIndex)
+				}
+				rf.mu.Unlock()
+				if pargs[localIndex] == nil {
 					reply := &InstallSnapshotReply{}
 					ok := rf.sendInstallSnapshot(localIndex, &sarg, reply)
 					if !ok {
