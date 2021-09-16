@@ -173,7 +173,7 @@ func (cfg *config) start1(i int) {
 				// ignore other types of ApplyMsg
 			} else {
 				v := m.Command
-				log.Printf("%v applied command index %v", i, m.CommandIndex - 1)
+				log.Printf("%v applied command index %v", i, m.CommandIndex-1)
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
@@ -451,7 +451,6 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 			}
 		}
-
 
 		if index != -1 {
 			// somebody claimed to be the leader and to have
